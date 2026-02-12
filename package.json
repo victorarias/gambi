@@ -1,0 +1,16 @@
+{
+  "name": "gambi-ui-tests",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Playwright admin UI test harness for gambi",
+  "scripts": {
+    "test:ui": "playwright test",
+    "test:ui:headed": "playwright test --headed",
+    "test:ui:debug": "playwright test --debug",
+    "test:ui:install": "playwright install chromium",
+    "docs:screenshots": "node scripts/capture-admin-screenshots.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.53.0"
+  }
+}

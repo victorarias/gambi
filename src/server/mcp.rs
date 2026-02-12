@@ -1,0 +1,1035 @@
+use std::{sync::Arc, time::Duration};
+
+use anyhow::{Context, Result, anyhow};
+use rmcp::{
+    ErrorData as McpError, Json, RoleServer, ServerHandler, ServiceExt,
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    model::{
+        CallToolRequestMethod, CallToolRequestParams, CallToolResult, GetPromptRequestParams,
+        GetPromptResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+        ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
+        ResourceContents, ServerCapabilities, ServerInfo, Tool,
+    },
+    schemars::JsonSchema,
+    service::RequestContext,
+    tool, tool_router,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
+
+use crate::auth::TokenState;
+use crate::config::ConfigStore;
+use crate::execution::{self, ExecuteOutput};
+use crate::namespacing::{
+    namespaced_resource_uri, parse_namespaced_resource_uri, split_namespaced,
+};
+use crate::upstream;
+
+const AGGREGATED_PAGE_SIZE: usize = 100;
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ListedServer {
+    name: String,
+    url: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ListServersOutput {
+    servers: Vec<ListedServer>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct UpstreamToolOutput {
+    namespaced_name: String,
+    server: String,
+    upstream_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct UpstreamFailureOutput {
+    server: String,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct UpstreamDiscoveryOutput {
+    tools: Vec<UpstreamToolOutput>,
+    failures: Vec<UpstreamFailureOutput>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct ExecuteRequest {
+    code: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ExecuteResponse {
+    result: serde_json::Value,
+    tool_calls: usize,
+    elapsed_ms: u128,
+    stdout: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct McpServer {
+    store: ConfigStore,
+    upstream: upstream::UpstreamManager,
+    exec_enabled: bool,
+    tool_router: ToolRouter<Self>,
+}
+
+impl McpServer {
+    fn new(store: ConfigStore, upstream: upstream::UpstreamManager, exec_enabled: bool) -> Self {
+        Self {
+            store,
+            upstream,
+            exec_enabled,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    fn local_tools(&self) -> Vec<Tool> {
+        let mut tools = self.tool_router.list_all();
+        if !self.exec_enabled {
+            tools.retain(|tool| tool.name.as_ref() != "gambi_execute");
+        }
+        tools
+    }
+}
+
+#[tool_router(router = tool_router)]
+impl McpServer {
+    #[tool(
+        name = "gambi_list_servers",
+        description = "List configured upstream servers"
+    )]
+    async fn gambi_list_servers(&self) -> Result<Json<ListServersOutput>, String> {
+        list_servers_output(&self.store).await
+    }
+
+    #[tool(
+        name = "gambi_list_upstream_tools",
+        description = "Discover tools from configured upstream MCP servers"
+    )]
+    async fn gambi_list_upstream_tools(&self) -> Result<Json<UpstreamDiscoveryOutput>, String> {
+        list_upstream_tools_output(&self.store, &self.upstream).await
+    }
+
+    #[tool(
+        name = "gambi_execute",
+        description = "Execute Python workflow in gambi (Monty runtime) with tool-call bridge and resource limits"
+    )]
+    async fn gambi_execute(
+        &self,
+        Parameters(params): Parameters<ExecuteRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ExecuteResponse>, String> {
+        if !self.exec_enabled {
+            return Err("gambi_execute is disabled for this server instance".to_string());
+        }
+
+        let output: ExecuteOutput =
+            execution::run_code_execution(&params.code, &self.store, &self.upstream, context)
+                .await
+                .map_err(|err| err.message)?;
+
+        Ok(Json(ExecuteResponse {
+            result: output.result,
+            tool_calls: output.tool_calls,
+            elapsed_ms: output.elapsed_ms,
+            stdout: output.stdout,
+        }))
+    }
+}
+
+impl ServerHandler for McpServer {
+    fn get_info(&self) -> ServerInfo {
+        let instructions = if self.exec_enabled {
+            "gambi aggregates upstream MCP capabilities and exposes gambi_execute by default"
+        } else {
+            "gambi aggregates upstream MCP capabilities with execution disabled (--no-exec)"
+        };
+
+        ServerInfo {
+            instructions: Some(instructions.into()),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .build(),
+            ..Default::default()
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        merged_list_tools(self.local_tools(), &self.store, &self.upstream, request).await
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if !self.exec_enabled && request.name.as_ref() == "gambi_execute" {
+            return Err(McpError::method_not_found::<CallToolRequestMethod>());
+        }
+
+        route_tool_call(
+            self,
+            &self.tool_router,
+            &self.store,
+            &self.upstream,
+            request,
+            context,
+        )
+        .await
+    }
+
+    async fn list_prompts(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        merged_list_prompts(&self.store, &self.upstream, request).await
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        route_get_prompt(&self.store, &self.upstream, request, context).await
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        merged_list_resources(&self.store, &self.upstream, request).await
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        merged_list_resource_templates(&self.store, &self.upstream, request).await
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        route_read_resource(&self.store, &self.upstream, request, context).await
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        if !self.exec_enabled && name == "gambi_execute" {
+            return None;
+        }
+        self.tool_router.get(name).cloned()
+    }
+}
+
+fn upstream_discovery_enabled_for_mcp_listing() -> bool {
+    std::env::var_os("GAMBI_DISABLE_UPSTREAM_DISCOVERY").is_none()
+}
+
+fn schema_compat_normalization_enabled() -> bool {
+    std::env::var("GAMBI_TOOL_SCHEMA_COMPAT_NORMALIZATION")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+async fn merged_list_tools(
+    mut tools: Vec<Tool>,
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    request: Option<PaginatedRequestParams>,
+) -> Result<ListToolsResult, McpError> {
+    if upstream_discovery_enabled_for_mcp_listing() {
+        let cfg = store.load_async().await.map_err(|err| {
+            McpError::internal_error(
+                format!("failed to load config for tool listing: {err}"),
+                None,
+            )
+        })?;
+        let auth_headers = load_upstream_auth_headers(store).await?;
+
+        let discovered = upstream_manager
+            .discover_tools_from_servers(&cfg.servers, &auth_headers)
+            .await
+            .map_err(|err| {
+                McpError::internal_error(
+                    format!("failed to discover upstream tools for listing: {err:#}"),
+                    None,
+                )
+            })?;
+
+        for failure in discovered.failures {
+            warn!(
+                server = %failure.server_name,
+                error = %failure.message,
+                "upstream tool discovery failed during list_tools"
+            );
+        }
+
+        for discovered_tool in discovered.tools {
+            let mut tool = discovered_tool.tool;
+            if let Some(description) = cfg.tool_description_override_for(
+                &discovered_tool.server_name,
+                &discovered_tool.upstream_name,
+            ) {
+                tool.description = Some(description.to_string().into());
+            }
+            tools.push(tool);
+        }
+    }
+
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools.dedup_by(|a, b| a.name == b.name);
+    if schema_compat_normalization_enabled() {
+        tools.iter_mut().for_each(normalize_tool_schema_for_clients);
+    }
+
+    let (tools, next_cursor) = paginate_items(tools, request)?;
+
+    Ok(ListToolsResult {
+        meta: None,
+        next_cursor,
+        tools,
+    })
+}
+
+fn normalize_tool_schema_for_clients(tool: &mut Tool) {
+    tool.input_schema = Arc::new(normalize_to_object_root(tool.input_schema.as_ref()));
+
+    if let Some(output_schema) = tool.output_schema.as_ref() {
+        let normalized = normalize_schema_fragments(output_schema.as_ref());
+        if is_object_root_schema(&normalized) {
+            tool.output_schema = Some(Arc::new(normalized));
+        } else {
+            // Some clients reject tool discovery when outputSchema does not conform.
+            tool.output_schema = None;
+        }
+    }
+}
+
+fn normalize_to_object_root(schema: &Map<String, Value>) -> Map<String, Value> {
+    let mut normalized = normalize_schema_fragments(schema);
+    let has_object_root = normalized
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|value| value == "object")
+        .unwrap_or(false);
+    if !has_object_root {
+        normalized.insert("type".to_string(), Value::String("object".to_string()));
+    }
+    normalized
+}
+
+fn normalize_schema_fragments(schema: &Map<String, Value>) -> Map<String, Value> {
+    let mut normalized = Map::new();
+    for (key, value) in schema {
+        let next = match value {
+            Value::Object(map) => Value::Object(normalize_schema_fragments(map)),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| match item {
+                        Value::Object(map) => Value::Object(normalize_schema_fragments(map)),
+                        other => other.clone(),
+                    })
+                    .collect(),
+            ),
+            // Preserve JSON Schema boolean fragments to avoid weakening upstream semantics.
+            Value::Bool(_) => value.clone(),
+            other => other.clone(),
+        };
+        normalized.insert(key.clone(), next);
+    }
+    normalized
+}
+
+fn is_object_root_schema(schema: &Map<String, Value>) -> bool {
+    schema
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|value| value == "object")
+        .unwrap_or(false)
+}
+
+async fn merged_list_prompts(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    request: Option<PaginatedRequestParams>,
+) -> Result<ListPromptsResult, McpError> {
+    if !upstream_discovery_enabled_for_mcp_listing() {
+        return Ok(ListPromptsResult::default());
+    }
+
+    let cfg = store.load_async().await.map_err(|err| {
+        McpError::internal_error(
+            format!("failed to load config for prompt listing: {err}"),
+            None,
+        )
+    })?;
+    let auth_headers = load_upstream_auth_headers(store).await?;
+
+    let discovered = upstream_manager
+        .discover_prompts_from_servers(&cfg.servers, &auth_headers)
+        .await
+        .map_err(|err| {
+            McpError::internal_error(
+                format!("failed to discover upstream prompts: {err:#}"),
+                None,
+            )
+        })?;
+
+    for failure in discovered.failures {
+        warn!(
+            server = %failure.server_name,
+            error = %failure.message,
+            "upstream prompt discovery failed during list_prompts"
+        );
+    }
+
+    let mut prompts = discovered
+        .prompts
+        .into_iter()
+        .map(|prompt| prompt.prompt)
+        .collect::<Vec<_>>();
+    prompts.sort_by(|a, b| a.name.cmp(&b.name));
+    prompts.dedup_by(|a, b| a.name == b.name);
+
+    let (prompts, next_cursor) = paginate_items(prompts, request)?;
+
+    Ok(ListPromptsResult {
+        meta: None,
+        next_cursor,
+        prompts,
+    })
+}
+
+async fn merged_list_resources(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    request: Option<PaginatedRequestParams>,
+) -> Result<ListResourcesResult, McpError> {
+    if !upstream_discovery_enabled_for_mcp_listing() {
+        return Ok(ListResourcesResult::default());
+    }
+
+    let cfg = store.load_async().await.map_err(|err| {
+        McpError::internal_error(
+            format!("failed to load config for resource listing: {err}"),
+            None,
+        )
+    })?;
+    let auth_headers = load_upstream_auth_headers(store).await?;
+
+    let discovered = upstream_manager
+        .discover_resources_from_servers(&cfg.servers, &auth_headers)
+        .await
+        .map_err(|err| {
+            McpError::internal_error(
+                format!("failed to discover upstream resources: {err:#}"),
+                None,
+            )
+        })?;
+
+    for failure in discovered.failures {
+        warn!(
+            server = %failure.server_name,
+            error = %failure.message,
+            "upstream resource discovery failed during list_resources"
+        );
+    }
+
+    let mut resources = discovered
+        .resources
+        .into_iter()
+        .map(|resource| resource.resource)
+        .collect::<Vec<_>>();
+    resources.sort_by(|a, b| a.raw.uri.cmp(&b.raw.uri));
+    resources.dedup_by(|a, b| a.raw.uri == b.raw.uri);
+
+    let (resources, next_cursor) = paginate_items(resources, request)?;
+
+    Ok(ListResourcesResult {
+        meta: None,
+        next_cursor,
+        resources,
+    })
+}
+
+async fn merged_list_resource_templates(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    request: Option<PaginatedRequestParams>,
+) -> Result<ListResourceTemplatesResult, McpError> {
+    if !upstream_discovery_enabled_for_mcp_listing() {
+        return Ok(ListResourceTemplatesResult::default());
+    }
+
+    let cfg = store.load_async().await.map_err(|err| {
+        McpError::internal_error(
+            format!("failed to load config for resource template listing: {err}"),
+            None,
+        )
+    })?;
+    let auth_headers = load_upstream_auth_headers(store).await?;
+
+    let discovered = upstream_manager
+        .discover_resources_from_servers(&cfg.servers, &auth_headers)
+        .await
+        .map_err(|err| {
+            McpError::internal_error(
+                format!("failed to discover upstream resource templates: {err:#}"),
+                None,
+            )
+        })?;
+
+    for failure in discovered.failures {
+        warn!(
+            server = %failure.server_name,
+            error = %failure.message,
+            "upstream resource template discovery failed during list_resource_templates"
+        );
+    }
+
+    let mut resource_templates = discovered
+        .resource_templates
+        .into_iter()
+        .map(|template| template.resource_template)
+        .collect::<Vec<_>>();
+    resource_templates.sort_by(|a, b| a.raw.uri_template.cmp(&b.raw.uri_template));
+    resource_templates.dedup_by(|a, b| a.raw.uri_template == b.raw.uri_template);
+
+    let (resource_templates, next_cursor) = paginate_items(resource_templates, request)?;
+
+    Ok(ListResourceTemplatesResult {
+        meta: None,
+        next_cursor,
+        resource_templates,
+    })
+}
+
+async fn route_tool_call<S>(
+    service: &S,
+    tool_router: &ToolRouter<S>,
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    request: CallToolRequestParams,
+    context: RequestContext<RoleServer>,
+) -> Result<CallToolResult, McpError>
+where
+    S: Send + Sync + 'static,
+{
+    if tool_router.has_route(request.name.as_ref()) {
+        return tool_router
+            .call(ToolCallContext::new(service, request, context))
+            .await;
+    }
+
+    let tool_name = request.name.clone().into_owned();
+    let Some((server_name, upstream_tool_name)) = split_namespaced(&tool_name) else {
+        return Err(McpError::method_not_found::<CallToolRequestMethod>());
+    };
+
+    let cfg = store.load_async().await.map_err(|err| {
+        McpError::internal_error(
+            format!("failed to load config for tool call routing: {err}"),
+            None,
+        )
+    })?;
+    let auth_headers = load_upstream_auth_headers(store).await?;
+
+    let Some(server) = cfg
+        .servers
+        .iter()
+        .find(|candidate| candidate.name == server_name)
+    else {
+        return Err(McpError::invalid_params(
+            format!("unknown tool namespace '{server_name}'"),
+            None,
+        ));
+    };
+
+    let mut upstream_request = request;
+    upstream_request.name = upstream_tool_name.to_string().into();
+    merge_request_meta(&mut upstream_request.meta, &context.meta);
+    map_upstream_request_error(
+        upstream_manager
+            .call_tool_on_server(
+                server,
+                &auth_headers,
+                upstream_request,
+                context.ct,
+                context
+                    .meta
+                    .get_progress_token()
+                    .map(|token| upstream::ProgressForwarder::new(context.peer.clone(), token)),
+            )
+            .await,
+        "tool",
+        server_name,
+        upstream_tool_name,
+    )
+}
+
+async fn route_get_prompt(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    request: GetPromptRequestParams,
+    context: RequestContext<RoleServer>,
+) -> Result<GetPromptResult, McpError> {
+    let namespaced_prompt = request.name.clone();
+    let Some((server_name, upstream_prompt_name)) = split_namespaced(&namespaced_prompt) else {
+        return Err(McpError::invalid_params(
+            "prompt name must be namespaced as '<server>:<prompt>'",
+            None,
+        ));
+    };
+    let server_name = server_name.to_string();
+    let upstream_prompt_name = upstream_prompt_name.to_string();
+
+    let cfg = store.load_async().await.map_err(|err| {
+        McpError::internal_error(
+            format!("failed to load config for prompt routing: {err}"),
+            None,
+        )
+    })?;
+    let auth_headers = load_upstream_auth_headers(store).await?;
+
+    let Some(server) = cfg
+        .servers
+        .iter()
+        .find(|candidate| candidate.name == server_name)
+    else {
+        return Err(McpError::invalid_params(
+            format!("unknown prompt namespace '{server_name}'"),
+            None,
+        ));
+    };
+
+    let mut upstream_request = request;
+    upstream_request.name = upstream_prompt_name.clone();
+    merge_request_meta(&mut upstream_request.meta, &context.meta);
+    map_upstream_request_error(
+        upstream_manager
+            .get_prompt_on_server(
+                server,
+                &auth_headers,
+                upstream_request,
+                context.ct,
+                context
+                    .meta
+                    .get_progress_token()
+                    .map(|token| upstream::ProgressForwarder::new(context.peer.clone(), token)),
+            )
+            .await,
+        "prompt",
+        &server_name,
+        &upstream_prompt_name,
+    )
+}
+
+async fn route_read_resource(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    request: ReadResourceRequestParams,
+    context: RequestContext<RoleServer>,
+) -> Result<ReadResourceResult, McpError> {
+    let Some((server_name, upstream_uri)) = parse_namespaced_resource_uri(&request.uri) else {
+        return Err(McpError::invalid_params(
+            "resource uri must use gambi namespaced format",
+            None,
+        ));
+    };
+
+    let cfg = store.load_async().await.map_err(|err| {
+        McpError::internal_error(
+            format!("failed to load config for resource routing: {err}"),
+            None,
+        )
+    })?;
+    let auth_headers = load_upstream_auth_headers(store).await?;
+
+    let Some(server) = cfg
+        .servers
+        .iter()
+        .find(|candidate| candidate.name == server_name)
+    else {
+        return Err(McpError::invalid_params(
+            format!("unknown resource namespace '{server_name}'"),
+            None,
+        ));
+    };
+
+    let mut upstream_request = request;
+    upstream_request.uri = upstream_uri.clone();
+    merge_request_meta(&mut upstream_request.meta, &context.meta);
+    let mut result = map_upstream_request_error(
+        upstream_manager
+            .read_resource_on_server(
+                server,
+                &auth_headers,
+                upstream_request,
+                context.ct,
+                context
+                    .meta
+                    .get_progress_token()
+                    .map(|token| upstream::ProgressForwarder::new(context.peer.clone(), token)),
+            )
+            .await,
+        "resource",
+        &server_name,
+        &upstream_uri,
+    )?;
+    rewrite_read_resource_result_uris(&mut result, &server_name);
+    Ok(result)
+}
+
+fn paginate_items<T>(
+    items: Vec<T>,
+    request: Option<PaginatedRequestParams>,
+) -> Result<(Vec<T>, Option<String>), McpError> {
+    let start = parse_cursor_offset(request.as_ref())?;
+    if start > items.len() {
+        return Err(McpError::invalid_params(
+            format!(
+                "cursor offset '{}' is out of range for {} item(s)",
+                start,
+                items.len()
+            ),
+            None,
+        ));
+    }
+
+    let end = (start + AGGREGATED_PAGE_SIZE).min(items.len());
+    let next_cursor = (end < items.len()).then(|| end.to_string());
+    let paged = items
+        .into_iter()
+        .skip(start)
+        .take(AGGREGATED_PAGE_SIZE)
+        .collect();
+
+    Ok((paged, next_cursor))
+}
+
+fn parse_cursor_offset(request: Option<&PaginatedRequestParams>) -> Result<usize, McpError> {
+    let Some(cursor) = request.and_then(|req| req.cursor.as_deref()) else {
+        return Ok(0);
+    };
+
+    cursor.parse::<usize>().map_err(|_| {
+        McpError::invalid_params(
+            format!("invalid cursor '{cursor}': expected numeric offset"),
+            None,
+        )
+    })
+}
+
+fn map_upstream_request_error<T>(
+    result: std::result::Result<T, upstream::UpstreamRequestError>,
+    capability_kind: &str,
+    server_name: &str,
+    upstream_id: &str,
+) -> Result<T, McpError> {
+    result.map_err(|err| match err {
+        upstream::UpstreamRequestError::Protocol(err) => err,
+        upstream::UpstreamRequestError::Cancelled => {
+            McpError::invalid_request("request cancelled", None)
+        }
+        upstream::UpstreamRequestError::Transport(err) => McpError::internal_error(
+            format!(
+                "upstream {capability_kind} request failed (server='{server_name}', id='{upstream_id}'): {err:#}"
+            ),
+            None,
+        ),
+    })
+}
+
+fn rewrite_read_resource_result_uris(result: &mut ReadResourceResult, server_name: &str) {
+    for content in &mut result.contents {
+        match content {
+            ResourceContents::TextResourceContents { uri, .. }
+            | ResourceContents::BlobResourceContents { uri, .. } => {
+                *uri = namespaced_resource_uri(server_name, uri);
+            }
+        }
+    }
+}
+
+fn merge_request_meta(target: &mut Option<rmcp::model::Meta>, source: &rmcp::model::Meta) {
+    match target {
+        Some(existing) => existing.extend(source.clone()),
+        None => *target = Some(source.clone()),
+    }
+}
+
+async fn load_upstream_auth_headers(
+    store: &ConfigStore,
+) -> Result<upstream::UpstreamAuthHeaders, McpError> {
+    let tokens: TokenState = store.load_tokens_async().await.map_err(|err| {
+        McpError::internal_error(
+            format!("failed to load token state for upstream routing: {err}"),
+            None,
+        )
+    })?;
+    Ok(upstream::auth_headers_from_token_state(&tokens))
+}
+
+pub async fn run(
+    store: ConfigStore,
+    upstream_manager: upstream::UpstreamManager,
+    exec_enabled: bool,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let service = McpServer::new(store, upstream_manager, exec_enabled)
+        .serve(rmcp::transport::stdio())
+        .await
+        .context("failed to start MCP stdio server")?;
+
+    wait_for_shutdown(service, shutdown).await
+}
+
+async fn wait_for_shutdown<S>(
+    service: rmcp::service::RunningService<rmcp::RoleServer, S>,
+    shutdown: CancellationToken,
+) -> Result<()>
+where
+    S: rmcp::service::Service<rmcp::RoleServer>,
+{
+    let cancellation = service.cancellation_token();
+    let mut waiter = tokio::spawn(async move { service.waiting().await });
+
+    tokio::select! {
+        _ = shutdown.cancelled() => {
+            cancellation.cancel();
+            match tokio::time::timeout(Duration::from_secs(3), &mut waiter).await {
+                Ok(joined) => handle_waiter_result(joined),
+                Err(_) => Err(anyhow!("timed out waiting for MCP service shutdown")),
+            }
+        }
+        joined = &mut waiter => handle_waiter_result(joined),
+    }
+}
+
+fn handle_waiter_result(
+    joined: Result<
+        Result<rmcp::service::QuitReason, tokio::task::JoinError>,
+        tokio::task::JoinError,
+    >,
+) -> Result<()> {
+    match joined {
+        Ok(Ok(reason)) => {
+            warn!(reason = ?reason, "MCP service exited");
+            Ok(())
+        }
+        Ok(Err(err)) => Err(anyhow!(err)).context("MCP service wait failed"),
+        Err(err) => Err(anyhow!(err)).context("MCP waiter task failed"),
+    }
+}
+
+async fn list_servers_output(store: &ConfigStore) -> Result<Json<ListServersOutput>, String> {
+    let cfg = store.load_async().await.map_err(|err| err.to_string())?;
+    let servers = cfg
+        .servers
+        .into_iter()
+        .map(|server| ListedServer {
+            name: server.name,
+            url: server.url,
+        })
+        .collect();
+
+    Ok(Json(ListServersOutput { servers }))
+}
+
+async fn list_upstream_tools_output(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+) -> Result<Json<UpstreamDiscoveryOutput>, String> {
+    let cfg = store.load_async().await.map_err(|err| err.to_string())?;
+    let tokens: TokenState = store
+        .load_tokens_async()
+        .await
+        .map_err(|err| err.to_string())?;
+    let auth_headers = upstream::auth_headers_from_token_state(&tokens);
+    let discovered = upstream_manager
+        .discover_tools_from_servers(&cfg.servers, &auth_headers)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let tools = discovered
+        .tools
+        .into_iter()
+        .map(|tool| UpstreamToolOutput {
+            namespaced_name: tool.namespaced_name,
+            server: tool.server_name,
+            upstream_name: tool.upstream_name,
+        })
+        .collect();
+    let failures = discovered
+        .failures
+        .into_iter()
+        .map(|failure| UpstreamFailureOutput {
+            server: failure.server_name,
+            error: failure.message,
+        })
+        .collect();
+
+    Ok(Json(UpstreamDiscoveryOutput { tools, failures }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rmcp::model::{ErrorCode, PaginatedRequestParams, Tool};
+    use serde_json::{Map, Value};
+
+    use super::{McpServer, normalize_tool_schema_for_clients, paginate_items};
+
+    #[test]
+    fn exec_mode_exposes_gambi_execute_tool() {
+        let server = McpServer::new(
+            crate::config::ConfigStore::with_base_dir(
+                tempfile::tempdir().expect("tempdir").path().join("gambi"),
+            ),
+            crate::upstream::UpstreamManager::new(),
+            true,
+        );
+        let names: Vec<String> = server
+            .local_tools()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+
+        assert!(names.iter().any(|name| name == "gambi_execute"));
+        assert!(names.iter().any(|name| name == "gambi_list_servers"));
+        assert!(names.iter().any(|name| name == "gambi_list_upstream_tools"));
+    }
+
+    #[test]
+    fn no_exec_mode_hides_gambi_execute_tool() {
+        let server = McpServer::new(
+            crate::config::ConfigStore::with_base_dir(
+                tempfile::tempdir().expect("tempdir").path().join("gambi"),
+            ),
+            crate::upstream::UpstreamManager::new(),
+            false,
+        );
+        let names: Vec<String> = server
+            .local_tools()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+
+        assert!(!names.iter().any(|name| name == "gambi_execute"));
+        assert!(names.iter().any(|name| name == "gambi_list_servers"));
+        assert!(names.iter().any(|name| name == "gambi_list_upstream_tools"));
+    }
+
+    #[test]
+    fn pagination_uses_numeric_cursor_offsets() {
+        let items: Vec<usize> = (0..205).collect();
+
+        let (first_page, first_cursor) = paginate_items(items, None).expect("first page");
+        assert_eq!(first_page.len(), 100);
+        assert_eq!(first_page[0], 0);
+        assert_eq!(first_page[99], 99);
+        assert_eq!(first_cursor.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn pagination_rejects_invalid_cursor() {
+        let items: Vec<usize> = (0..10).collect();
+        let err = paginate_items(
+            items,
+            Some(PaginatedRequestParams {
+                meta: None,
+                cursor: Some("bad-cursor".to_string()),
+            }),
+        )
+        .expect_err("invalid cursor must fail");
+
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("invalid cursor"));
+    }
+
+    #[test]
+    fn normalize_tool_schema_forces_object_input_schema_root() {
+        let mut input_schema = Map::new();
+        input_schema.insert("type".to_string(), Value::String("null".to_string()));
+        let mut tool = Tool::new("example_tool", "example", Arc::new(input_schema));
+
+        normalize_tool_schema_for_clients(&mut tool);
+
+        assert_eq!(
+            tool.input_schema
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            "object"
+        );
+    }
+
+    #[test]
+    fn normalize_tool_schema_drops_non_object_output_schema_root() {
+        let mut tool = Tool::new("example_tool", "example", Arc::new(Map::new()));
+        let mut output_schema = Map::new();
+        output_schema.insert("type".to_string(), Value::String("array".to_string()));
+        tool.output_schema = Some(Arc::new(output_schema));
+
+        normalize_tool_schema_for_clients(&mut tool);
+
+        assert!(tool.output_schema.is_none());
+    }
+
+    #[test]
+    fn normalize_tool_schema_preserves_boolean_subschemas() {
+        let mut input_schema = Map::new();
+        input_schema.insert("type".to_string(), Value::String("object".to_string()));
+        input_schema.insert("additionalProperties".to_string(), Value::Bool(false));
+        let mut nested = Map::new();
+        nested.insert(
+            "anyOf".to_string(),
+            Value::Array(vec![Value::Bool(true), Value::Object(Map::new())]),
+        );
+        input_schema.insert("properties".to_string(), Value::Object(nested));
+        let mut tool = Tool::new("example_tool", "example", Arc::new(input_schema));
+
+        normalize_tool_schema_for_clients(&mut tool);
+
+        assert_eq!(
+            tool.input_schema
+                .get("additionalProperties")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let any_of_items = tool
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get("anyOf"))
+            .and_then(Value::as_array)
+            .expect("anyOf array should exist");
+        assert_eq!(any_of_items.first().and_then(Value::as_bool), Some(true));
+    }
+}

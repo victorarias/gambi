@@ -1,0 +1,34 @@
+[package]
+name = "gambi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+axum = "0.8.8"
+base64 = "0.22.1"
+clap = { version = "4.5.31", features = ["derive"] }
+dirs = "6.0.0"
+fs2 = "0.4.3"
+rand = "0.8.5"
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "0.15.0", features = ["client", "reqwest", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+schemars = "1.2.0"
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.8"
+tempfile = "3.18.0"
+tokio = { version = "1.43.0", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal"] }
+tokio-util = "0.7.13"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+url = "2.5.4"
+keyring = "3.6.2"
+monty = { git = "https://github.com/pydantic/monty", rev = "fc2f15405afc71e0b027fbd0bbdb6f9a4600f333", package = "monty" }
+num-bigint = "0.4.6"
+num-traits = "0.2.19"
+
+[dev-dependencies]
+tokio-stream = "0.1.17"
+futures = "0.3.31"
+proptest = "1.6.0"

@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Harness profile"
+        type: choice
+        options: ["ci", "full", "soak", "ui"]
+        default: "ci"
+      stress_loops:
+        description: "Stress loop count for full/soak profiles"
+        required: false
+        default: "3"
+      stress_matrix:
+        description: "Run heavy stress matrix in full profile (1=yes, 0=no)"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run CI harness
+        if: github.event_name != 'workflow_dispatch'
+        run: ./scripts/test-harness.sh ci
+
+      - name: Run selected workflow_dispatch harness profile
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GAMBI_STRESS_LOOPS: ${{ github.event.inputs.stress_loops }}
+          GAMBI_STRESS_MATRIX: ${{ github.event.inputs.stress_matrix }}
+        run: ./scripts/test-harness.sh "${{ github.event.inputs.profile }}"
+
+      - name: Upload Playwright artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            playwright-report
+            test-results
+          if-no-files-found: ignore
