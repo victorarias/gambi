@@ -2,23 +2,28 @@ use std::{
     collections::BTreeMap,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::Path,
+    extract::Request,
     extract::{Query, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth::{AuthManager, AuthServerStatus, AuthStartResponse, TokenState};
-use crate::config::{AppConfig, ConfigStore, ServerConfig};
+use crate::config::{AppConfig, ConfigStore, ExposureMode, ServerConfig};
 use crate::logging;
 use crate::upstream;
 
@@ -29,6 +34,25 @@ struct AppState {
     upstream: upstream::UpstreamManager,
     exec_enabled: bool,
     admin_base_url: String,
+    activity: ActivityTracker,
+    shutdown: CancellationToken,
+}
+
+#[derive(Clone)]
+struct ActivityTracker(Arc<Mutex<Instant>>);
+
+impl ActivityTracker {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    async fn touch(&self) {
+        *self.0.lock().await = Instant::now();
+    }
+
+    async fn idle_for(&self) -> Duration {
+        self.0.lock().await.elapsed()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +133,11 @@ struct RemoveToolDescriptionOverrideRequest {
     tool: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateServerExposureRequest {
+    exposure_mode: ExposureMode,
+}
+
 #[derive(Debug, Serialize)]
 struct AuthStatusesResponse {
     statuses: Vec<AuthServerStatus>,
@@ -172,12 +201,14 @@ pub async fn run(
     upstream: upstream::UpstreamManager,
     exec_enabled: bool,
     shutdown: CancellationToken,
+    idle_timeout: Option<Duration>,
 ) -> Result<()> {
     let AdminBindOptions {
         host,
         port,
         port_file: admin_port_file,
     } = bind;
+    info!(host = %host, port, "starting admin UI listener");
     let admin_addr = SocketAddr::from((host, port));
     let listener = tokio::net::TcpListener::bind(admin_addr)
         .await
@@ -193,19 +224,25 @@ pub async fn run(
             })?;
     }
 
+    let activity = ActivityTracker::new();
     let state = AppState {
         store,
         auth,
         upstream,
         exec_enabled,
         admin_base_url: format!("http://{local_addr}"),
+        activity: activity.clone(),
+        shutdown: shutdown.clone(),
     };
 
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
+        .route("/heartbeat", post(heartbeat))
+        .route("/shutdown", post(shutdown_daemon))
         .route("/status", get(status))
         .route("/servers", get(servers).post(add_server))
+        .route("/servers/{name}/exposure", post(update_server_exposure))
         .route("/servers/{name}", delete(remove_server))
         .route("/tools", get(tools))
         .route("/tool-descriptions", post(set_tool_description_override))
@@ -220,16 +257,49 @@ pub async fn run(
         .route("/auth/start", post(auth_start))
         .route("/auth/refresh", post(auth_refresh))
         .route("/auth/callback", get(auth_callback))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            track_activity,
+        ))
         .with_state(state);
 
     info!(addr = %local_addr, "admin UI listening");
 
+    let idle_cancel = CancellationToken::new();
+    if let Some(timeout) = idle_timeout {
+        let activity = activity.clone();
+        let idle_cancel = idle_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let idle_for = activity.idle_for().await;
+                if idle_for >= timeout {
+                    info!(
+                        idle_seconds = idle_for.as_secs(),
+                        timeout_seconds = timeout.as_secs(),
+                        "admin idle timeout reached; shutting down"
+                    );
+                    idle_cancel.cancel();
+                    break;
+                }
+            }
+        });
+    }
+
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                _ = idle_cancel.cancelled() => {}
+            }
         })
         .await
         .context("admin server exited unexpectedly")
+}
+
+async fn track_activity(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    state.activity.touch().await;
+    next.run(request).await
 }
 
 async fn root() -> Html<&'static str> {
@@ -303,6 +373,7 @@ async fn root() -> Html<&'static str> {
 
     .a-item { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; font-family: var(--mono); font-size: 12px; border-bottom: 1px solid var(--border); }
     .a-item:last-child { border-bottom: 0; }
+    .a-right { display: flex; align-items: center; gap: 8px; }
     .a-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: 6px; }
     .a-ok { background: var(--green); }
     .a-no { background: var(--text-3); }
@@ -368,8 +439,26 @@ async fn root() -> Html<&'static str> {
           <div class="row">
             <input id="server-name" placeholder="server name (e.g. github)" required>
             <input id="server-url" placeholder="url (e.g. stdio://... or https://...)" required>
+            <select id="server-exposure-add">
+              <option value="passthrough">passthrough</option>
+              <option value="compact">compact</option>
+              <option value="names-only">names-only</option>
+              <option value="server-only">server-only</option>
+            </select>
           </div>
           <button type="submit">Add Server</button>
+        </form>
+        <form id="server-exposure-form">
+          <div class="row">
+            <select id="server-exposure-name"></select>
+            <select id="server-exposure-mode">
+              <option value="passthrough">passthrough</option>
+              <option value="compact">compact</option>
+              <option value="names-only">names-only</option>
+              <option value="server-only">server-only</option>
+            </select>
+            <button type="submit">Set Exposure</button>
+          </div>
         </form>
         <form id="server-remove-form">
           <div class="row">
@@ -511,6 +600,9 @@ async fn root() -> Html<&'static str> {
       const hasServers = hasConfiguredServers();
       document.getElementById('server-remove-name').disabled = !hasServers;
       document.querySelector('#server-remove-form button[type=submit]').disabled = !hasServers;
+      document.getElementById('server-exposure-name').disabled = !hasServers;
+      document.getElementById('server-exposure-mode').disabled = !hasServers;
+      document.querySelector('#server-exposure-form button[type=submit]').disabled = !hasServers;
       document.getElementById('override-server').disabled = !hasServers;
       document.querySelector('#override-set-form button[type=submit]').disabled = !hasServers;
       document.getElementById('override-remove-server').disabled = !hasServers;
@@ -553,7 +645,8 @@ async fn root() -> Html<&'static str> {
         return;
       }
       v.innerHTML = servers.map(function(s) {
-        return '<div class="v-item"><span class="v-name">' + esc(s.name) + '</span><span class="v-det">' + esc(s.url) + '</span></div>';
+        const exposure = s.exposure_mode || 'passthrough';
+        return '<div class="v-item"><span class="v-name">' + esc(s.name) + '</span><span class="v-det">' + esc(s.url) + ' · ' + esc(exposure) + '</span></div>';
       }).join('');
     }
 
@@ -613,14 +706,44 @@ async fn root() -> Html<&'static str> {
       for (let i = 0; i < p.statuses.length; i++) {
         const s = p.statuses[i];
         let dot = 'a-no', label = 'not configured';
-        if (s.auth_configured && !s.has_token) { dot = 'a-no'; label = 'no token'; }
+        if (s.oauth_configured && !s.has_token) { dot = 'a-no'; label = 'no token'; }
         if (s.has_token) { dot = 'a-ok'; label = 'authenticated'; }
         if (s.degraded) { dot = 'a-warn'; label = 'degraded'; }
         if (s.last_error) { dot = 'a-bad'; label = s.last_error; }
-        if (!s.auth_configured) { label = 'not configured'; }
-        h += '<div class="a-item"><span><span class="a-dot ' + dot + '"></span>' + esc(s.server) + '</span><span style="color:var(--text-3)">' + esc(label) + '</span></div>';
+        if (!s.oauth_configured) { label = 'not configured'; }
+        const canLogin = Boolean(s.oauth_configured) && !Boolean(s.has_token);
+        const loginBtn = canLogin ? '<button class="raw-btn" data-server="' + escAttrHtml(s.server) + '" onclick="startOauth(this.getAttribute(&#39;data-server&#39;))">login</button>' : '';
+        h += '<div class="a-item"><span><span class="a-dot ' + dot + '"></span>' + esc(s.server) + '</span><span class="a-right"><span style="color:var(--text-3)">' + esc(label) + '</span>' + loginBtn + '</span></div>';
       }
       v.innerHTML = h;
+    }
+
+    function escAttrHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    async function startOauth(server) {
+      await runAction('start oauth', async function() {
+        const response = await fetch('/auth/start', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ server: server })
+        });
+        if (!response.ok) {
+          const message = await readErrorMessage(response);
+          throw new Error(response.status + ': ' + message);
+        }
+        const payload = await response.json();
+        if (!payload || !payload.auth_url) {
+          throw new Error('missing auth_url in /auth/start response');
+        }
+        window.open(payload.auth_url, '_blank', 'noopener');
+      });
     }
 
     async function refresh(options) {
@@ -654,6 +777,7 @@ async fn root() -> Html<&'static str> {
         renderAuthView(authPayload);
 
         setServerOptions('server-remove-name', currentServers);
+        setServerOptions('server-exposure-name', currentServers);
         setServerOptions('override-server', currentServers);
         setServerOptions('override-remove-server', currentServers);
         setMutationFormState();
@@ -698,9 +822,24 @@ async fn root() -> Html<&'static str> {
       await runAction('add server', async function() {
         await postJson('/servers', {
           name: document.getElementById('server-name').value,
-          url: document.getElementById('server-url').value
+          url: document.getElementById('server-url').value,
+          exposure_mode: document.getElementById('server-exposure-add').value
         });
         event.target.reset();
+        await refresh({ forceTools: true });
+      });
+    });
+
+    document.getElementById('server-exposure-form').addEventListener('submit', async function(event) {
+      event.preventDefault();
+      await runAction('set exposure mode', async function() {
+        const name = document.getElementById('server-exposure-name').value;
+        if (!name) {
+          throw new Error('no server selected');
+        }
+        await postJson('/servers/' + encodeURIComponent(name) + '/exposure', {
+          exposure_mode: document.getElementById('server-exposure-mode').value
+        });
         await refresh({ forceTools: true });
       });
     });
@@ -763,6 +902,15 @@ async fn root() -> Html<&'static str> {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn heartbeat() -> Json<MutationResponse> {
+    Json(MutationResponse { status: "ok" })
+}
+
+async fn shutdown_daemon(State(state): State<AppState>) -> Json<MutationResponse> {
+    state.shutdown.cancel();
+    Json(MutationResponse { status: "ok" })
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
@@ -834,6 +982,28 @@ async fn remove_server(
     Ok(Json(MutationResponse { status: "ok" }))
 }
 
+async fn update_server_exposure(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(request): Json<UpdateServerExposureRequest>,
+) -> Result<Json<MutationResponse>, ApiError> {
+    let target_name = name.clone();
+    state
+        .store
+        .update_async(move |cfg| cfg.set_server_exposure_mode(&target_name, request.exposure_mode))
+        .await
+        .map_err(|err| {
+            error!(
+                error = %err,
+                server = %name,
+                "failed to update server exposure mode"
+            );
+            ApiError::bad_request(format!("failed to update exposure mode: {err}"))
+        })?;
+    state.upstream.invalidate_discovery_cache().await;
+    Ok(Json(MutationResponse { status: "ok" }))
+}
+
 async fn set_tool_description_override(
     State(state): State<AppState>,
     Json(request): Json<ToolDescriptionOverrideRequest>,
@@ -901,6 +1071,62 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
             ApiError::internal("failed to discover upstream tools")
         })?;
 
+    // If an HTTP upstream says "auth required" and we don't have a client_id yet, attempt
+    // MCP-spec OAuth discovery + RFC 7591 dynamic client registration in the background.
+    for failure in &discovery.failures {
+        if !looks_like_auth_required(&failure.message) {
+            continue;
+        }
+        let should_try_refresh = looks_like_invalid_token(&failure.message);
+        let is_http = cfg
+            .servers
+            .iter()
+            .find(|server| server.name == failure.server_name)
+            .is_some_and(|server| {
+                server.url.starts_with("http://") || server.url.starts_with("https://")
+            });
+        if !is_http {
+            continue;
+        }
+
+        let auth = state.auth.clone();
+        let upstream = state.upstream.clone();
+        let server_name = failure.server_name.clone();
+        let admin_base_url = state.admin_base_url.clone();
+        tokio::spawn(async move {
+            if let Err(err) = auth
+                .ensure_registered_client(&server_name, &admin_base_url)
+                .await
+            {
+                error!(
+                    error = %err,
+                    server = %server_name,
+                    "oauth bootstrap after auth-required upstream failure did not succeed"
+                );
+            }
+            if should_try_refresh {
+                match auth.refresh(&server_name).await {
+                    Ok(response) => {
+                        info!(
+                            server = %server_name,
+                            refreshed = response.refreshed,
+                            expires_at_epoch_seconds = ?response.expires_at_epoch_seconds,
+                            "upstream reported invalid_token; oauth refresh succeeded"
+                        );
+                        upstream.invalidate_discovery_cache().await;
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            server = %server_name,
+                            "upstream reported invalid_token and oauth refresh failed"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let mut tool_details = BTreeMap::<String, String>::new();
     for tool in &discovery.tools {
         let description = cfg
@@ -922,7 +1148,12 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
     );
     tool_details.insert(
         "gambi_list_upstream_tools".to_string(),
-        "Discover tools from configured upstream MCP servers".to_string(),
+        "Discover upstream tool names and discovery failures for troubleshooting".to_string(),
+    );
+    tool_details.insert(
+        "gambi_help".to_string(),
+        "Explain upstream MCP capabilities and return full tool metadata on demand (execute-only workflow)"
+            .to_string(),
     );
     if state.exec_enabled {
         tool_details.insert(
@@ -942,6 +1173,20 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
         .collect::<Vec<_>>();
 
     let tools = tool_details.keys().cloned().collect::<Vec<_>>();
+    let has_gambi_execute = tools.iter().any(|tool| tool == "gambi_execute");
+    if state.exec_enabled && !has_gambi_execute {
+        warn!(
+            tool_count = tools.len(),
+            failure_count = failures.len(),
+            "admin tools snapshot missing gambi_execute while exec mode is enabled"
+        );
+    }
+    info!(
+        tool_count = tools.len(),
+        failure_count = failures.len(),
+        has_gambi_execute,
+        "admin tools snapshot prepared"
+    );
     let tool_details = tool_details
         .into_iter()
         .map(|(name, description)| ToolDetail { name, description })
@@ -952,6 +1197,22 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
         tool_details,
         failures,
     }))
+}
+
+fn looks_like_auth_required(message: &str) -> bool {
+    let msg = message.trim().to_ascii_lowercase();
+    msg.contains("auth required")
+        || msg.contains("unauthorized")
+        || msg.contains("forbidden")
+        || msg.contains("401")
+        || msg.contains("403")
+}
+
+fn looks_like_invalid_token(message: &str) -> bool {
+    message
+        .trim()
+        .to_ascii_lowercase()
+        .contains("invalid_token")
 }
 
 async fn logs(Query(query): Query<LogsQuery>) -> Result<Json<LogsResponse>, ApiError> {

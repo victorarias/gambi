@@ -169,7 +169,7 @@ Token storage profiles:
 
 | Variable | Purpose |
 |----------|---------|
-| `GAMBI_TOOL_SCHEMA_COMPAT_NORMALIZATION=1` | Legacy normalization for strict clients |
+| `GAMBI_TOOL_SCHEMA_COMPAT_NORMALIZATION=0` | Disable strict-client schema normalization (enabled by default) |
 
 ## Security model
 

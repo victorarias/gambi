@@ -6,6 +6,7 @@ mod fixture_progress;
 mod logging;
 mod namespacing;
 mod server;
+mod sse_transport;
 mod upstream;
 
 use anyhow::Result;

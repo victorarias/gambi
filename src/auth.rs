@@ -26,6 +26,19 @@ pub struct TokenState {
     pub oauth_tokens: BTreeMap<String, OAuthToken>,
     #[serde(default)]
     pub oauth_health: BTreeMap<String, OAuthServerHealth>,
+    #[serde(default)]
+    pub registered_clients: BTreeMap<String, RegisteredClient>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredClient {
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_client_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_access_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +84,26 @@ pub struct AuthStartResponse {
     pub state: String,
 }
 
+#[derive(Debug, Serialize)]
+struct DynamicClientRegistrationRequest {
+    redirect_uris: Vec<String>,
+    grant_types: Vec<String>,
+    response_types: Vec<String>,
+    token_endpoint_auth_method: String,
+    client_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicClientRegistrationResponse {
+    client_id: String,
+    #[serde(default)]
+    client_secret: Option<String>,
+    #[serde(default)]
+    registration_client_uri: Option<String>,
+    #[serde(default)]
+    registration_access_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthRefreshResponse {
     pub server: String,
@@ -111,6 +144,8 @@ struct OAuthDiscoveryDocument {
     authorization_endpoint: Option<String>,
     #[serde(default)]
     token_endpoint: Option<String>,
+    #[serde(default)]
+    registration_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,9 +212,13 @@ impl AuthManager {
         for server in cfg.servers {
             let token = tokens.oauth_tokens.get(&server.name);
             let health = tokens.oauth_health.get(&server.name);
+            let has_registered_client = tokens.registered_clients.contains_key(&server.name);
+            let can_discover_oauth = mcp_oauth_discovery_url_for_server_url(&server.url).is_some();
             statuses.push(AuthServerStatus {
                 server: server.name,
-                oauth_configured: server.oauth.is_some(),
+                oauth_configured: server.oauth.is_some()
+                    || has_registered_client
+                    || can_discover_oauth,
                 has_token: token.is_some(),
                 expires_at_epoch_seconds: token.and_then(|value| value.expires_at_epoch_seconds),
                 degraded: health.map(|state| state.degraded).unwrap_or(false),
@@ -198,15 +237,22 @@ impl AuthManager {
         admin_base_url: &str,
     ) -> Result<AuthStartResponse> {
         let cfg = self.store.load_async().await?;
-        let oauth = oauth_for_server(&cfg, server_name)?;
-        let resolved = self.resolve_oauth_config(oauth).await;
-
         let code_verifier = random_url_safe(64);
         let state = random_url_safe(48);
         let redirect_uri = format!(
             "{}/auth/callback",
             admin_base_url.trim_end_matches('/').trim_end_matches(' ')
         );
+
+        let server = server_for_name(&cfg, server_name)?;
+        let resolved = self
+            .resolve_oauth_config(
+                server_name,
+                &server.url,
+                server.oauth.as_ref(),
+                Some(&redirect_uri),
+            )
+            .await?;
 
         let code_challenge = {
             let hash = Sha256::digest(code_verifier.as_bytes());
@@ -252,6 +298,31 @@ impl AuthManager {
         })
     }
 
+    /// Best-effort bootstrap: discover OAuth metadata and dynamically register a client if needed.
+    /// Intended for calling when an upstream HTTP server reports "auth required" before the user
+    /// explicitly starts the OAuth flow.
+    pub async fn ensure_registered_client(
+        &self,
+        server_name: &str,
+        admin_base_url: &str,
+    ) -> Result<()> {
+        let cfg = self.store.load_async().await?;
+        let server = server_for_name(&cfg, server_name)?;
+        let redirect_uri = format!(
+            "{}/auth/callback",
+            admin_base_url.trim_end_matches('/').trim_end_matches(' ')
+        );
+        let _ = self
+            .resolve_oauth_config(
+                server_name,
+                &server.url,
+                server.oauth.as_ref(),
+                Some(&redirect_uri),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn callback(&self, state: &str, code: &str) -> Result<AuthCallbackResponse> {
         if code.trim().is_empty() {
             bail!("authorization code is required");
@@ -273,8 +344,15 @@ impl AuthManager {
         }
 
         let cfg = self.store.load_async().await?;
-        let oauth = oauth_for_server(&cfg, &pending.server_name)?;
-        let resolved = self.resolve_oauth_config(oauth).await;
+        let server = server_for_name(&cfg, &pending.server_name)?;
+        let resolved = self
+            .resolve_oauth_config(
+                &pending.server_name,
+                &server.url,
+                server.oauth.as_ref(),
+                Some(&pending.redirect_uri),
+            )
+            .await?;
 
         let token_response = exchange_authorization_code(
             &self.http,
@@ -405,8 +483,10 @@ impl AuthManager {
 
     async fn refresh_once(&self, server_name: &str) -> Result<AuthRefreshResponse> {
         let cfg = self.store.load_async().await?;
-        let oauth = oauth_for_server(&cfg, server_name)?;
-        let resolved = self.resolve_oauth_config(oauth).await;
+        let server = server_for_name(&cfg, server_name)?;
+        let resolved = self
+            .resolve_oauth_config(server_name, &server.url, server.oauth.as_ref(), None)
+            .await?;
         let current: TokenState = self.store.load_tokens_async().await?;
 
         let Some(existing) = current.oauth_tokens.get(server_name) else {
@@ -458,41 +538,181 @@ impl AuthManager {
         })
     }
 
-    async fn resolve_oauth_config(&self, oauth: &OAuthConfig) -> ResolvedOAuthConfig {
-        let mut authorize_url = oauth.authorize_url.clone();
-        let mut token_url = oauth.token_url.clone();
+    async fn resolve_oauth_config(
+        &self,
+        server_name: &str,
+        server_url: &str,
+        oauth: Option<&OAuthConfig>,
+        redirect_uri: Option<&str>,
+    ) -> Result<ResolvedOAuthConfig> {
+        let mut authorize_url = oauth
+            .map(|value| value.authorize_url.clone())
+            .unwrap_or_default();
+        let mut token_url = oauth
+            .map(|value| value.token_url.clone())
+            .unwrap_or_default();
+        let scopes = oauth.map(|value| value.scopes.clone()).unwrap_or_default();
+        let configured_client_id = oauth.and_then(|value| value.client_id.clone());
 
-        if let Some(discovery_url) = oauth.discovery_url.as_deref() {
-            match self.fetch_discovery_document(discovery_url).await {
-                Ok(doc) => {
-                    if let Some(value) = sanitize_discovered_url(
-                        doc.authorization_endpoint.as_deref(),
-                        "authorization_endpoint",
-                    ) {
-                        authorize_url = value;
-                    }
-                    if let Some(value) =
-                        sanitize_discovered_url(doc.token_endpoint.as_deref(), "token_endpoint")
-                    {
-                        token_url = value;
+        let configured_discovery_url = oauth.and_then(|value| value.discovery_url.clone());
+        let derived_discovery_url =
+            configured_discovery_url.or_else(|| mcp_oauth_discovery_url_for_server_url(server_url));
+
+        let discovered = match derived_discovery_url.as_deref() {
+            Some(discovery_url) => match self.fetch_discovery_document(discovery_url).await {
+                Ok(doc) => Some((discovery_url.to_string(), doc)),
+                Err(err) => {
+                    if oauth.is_some() {
+                        warn!(
+                            discovery_url,
+                            error = %err,
+                            "oauth discovery failed; using configured endpoint fallback"
+                        );
+                        None
+                    } else {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "oauth discovery failed for '{server_name}' (no configured oauth endpoints to fall back to)"
+                            )
+                        });
                     }
                 }
-                Err(err) => {
-                    warn!(
-                        discovery_url,
-                        error = %err,
-                        "oauth discovery failed; using configured endpoint fallback"
+            },
+            None => {
+                if oauth.is_some() {
+                    None
+                } else {
+                    bail!(
+                        "oauth discovery is required for server '{server_name}', but server url '{}' cannot be converted to an origin",
+                        server_url
                     );
                 }
             }
+        };
+
+        let mut registration_endpoint: Option<String> = None;
+        if let Some((_discovery_url, doc)) = discovered.as_ref() {
+            if let Some(value) = sanitize_discovered_url(
+                doc.authorization_endpoint.as_deref(),
+                "authorization_endpoint",
+            ) {
+                authorize_url = value;
+            }
+            if let Some(value) =
+                sanitize_discovered_url(doc.token_endpoint.as_deref(), "token_endpoint")
+            {
+                token_url = value;
+            }
+            registration_endpoint = sanitize_discovered_url(
+                doc.registration_endpoint.as_deref(),
+                "registration_endpoint",
+            );
         }
 
-        ResolvedOAuthConfig {
+        if authorize_url.trim().is_empty() {
+            bail!("oauth authorize_url is not available for server '{server_name}'");
+        }
+        if token_url.trim().is_empty() {
+            bail!("oauth token_url is not available for server '{server_name}'");
+        }
+
+        let tokens: TokenState = self.store.load_tokens_async().await?;
+        let persisted_client_id = tokens
+            .registered_clients
+            .get(server_name)
+            .map(|value| value.client_id.clone());
+
+        let mut client_id = configured_client_id.or(persisted_client_id);
+
+        if client_id.is_none() {
+            let Some(registration_endpoint) = registration_endpoint else {
+                bail!(
+                    "oauth client_id is not configured for server '{server_name}', and dynamic client registration is not available"
+                );
+            };
+            let redirect_uri = redirect_uri.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "oauth client_id is not configured for server '{server_name}', and dynamic registration requires a redirect_uri"
+                )
+            })?;
+
+            let registered = self
+                .dynamic_register_client(&registration_endpoint, redirect_uri)
+                .await
+                .with_context(|| {
+                    format!(
+                        "dynamic client registration failed for server '{server_name}' at '{}'",
+                        registration_endpoint
+                    )
+                })?;
+
+            let client_id_value = registered.client_id.clone();
+            let server_name_owned = server_name.to_string();
+            self.store
+                .update_tokens_async::<TokenState, _, _>(move |tokens| {
+                    tokens
+                        .registered_clients
+                        .insert(server_name_owned.clone(), registered.clone());
+                    Ok(())
+                })
+                .await
+                .context("failed to persist dynamically registered oauth client")?;
+
+            client_id = Some(client_id_value);
+        }
+
+        let client_id = client_id.ok_or_else(|| {
+            anyhow::anyhow!("oauth client_id could not be resolved for server '{server_name}'")
+        })?;
+
+        Ok(ResolvedOAuthConfig {
             authorize_url,
             token_url,
-            client_id: oauth.client_id.clone(),
-            scopes: oauth.scopes.clone(),
+            client_id,
+            scopes,
+        })
+    }
+
+    async fn dynamic_register_client(
+        &self,
+        registration_endpoint: &str,
+        redirect_uri: &str,
+    ) -> Result<RegisteredClient> {
+        let request = DynamicClientRegistrationRequest {
+            redirect_uris: vec![redirect_uri.to_string()],
+            grant_types: vec![
+                "authorization_code".to_string(),
+                "refresh_token".to_string(),
+            ],
+            response_types: vec!["code".to_string()],
+            token_endpoint_auth_method: "none".to_string(),
+            client_name: "gambi".to_string(),
+        };
+
+        let response = self
+            .http
+            .post(registration_endpoint)
+            .json(&request)
+            .send()
+            .await
+            .context("client registration request failed")?
+            .error_for_status()
+            .context("client registration returned error response")?
+            .json::<DynamicClientRegistrationResponse>()
+            .await
+            .context("client registration response JSON is invalid")?;
+
+        let client_id = response.client_id.trim().to_string();
+        if client_id.is_empty() {
+            bail!("client registration response did not include a client_id");
         }
+
+        Ok(RegisteredClient {
+            client_id,
+            client_secret: response.client_secret,
+            registration_client_uri: response.registration_client_uri,
+            registration_access_token: response.registration_access_token,
+        })
     }
 
     async fn fetch_discovery_document(
@@ -582,17 +802,30 @@ impl AuthManager {
     }
 }
 
-fn oauth_for_server<'a>(
+fn server_for_name<'a>(
     cfg: &'a crate::config::AppConfig,
     server_name: &str,
-) -> Result<&'a OAuthConfig> {
-    let Some(server) = cfg.servers.iter().find(|item| item.name == server_name) else {
-        bail!("unknown server '{server_name}'");
-    };
-    let Some(oauth) = server.oauth.as_ref() else {
-        bail!("server '{server_name}' does not have oauth configured");
-    };
-    Ok(oauth)
+) -> Result<&'a crate::config::ServerConfig> {
+    cfg.servers
+        .iter()
+        .find(|item| item.name == server_name)
+        .ok_or_else(|| anyhow::anyhow!("unknown server '{server_name}'"))
+}
+
+fn mcp_oauth_discovery_url_for_server_url(server_url: &str) -> Option<String> {
+    let parsed = Url::parse(server_url).ok()?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return None,
+    }
+    let origin = parsed.origin().ascii_serialization();
+    if origin == "null" {
+        return None;
+    }
+    Some(format!(
+        "{origin}/.well-known/oauth-authorization-server",
+        origin = origin.trim_end_matches('/')
+    ))
 }
 
 async fn exchange_authorization_code(
@@ -703,7 +936,16 @@ pub fn prune_token_state_for_server_names(
         .retain(|server, _| server_names.contains(server));
     let removed_oauth_health = before_oauth_health.saturating_sub(tokens.oauth_health.len());
 
-    removed_oauth_tokens.saturating_add(removed_oauth_health)
+    let before_registered_clients = tokens.registered_clients.len();
+    tokens
+        .registered_clients
+        .retain(|server, _| server_names.contains(server));
+    let removed_registered_clients =
+        before_registered_clients.saturating_sub(tokens.registered_clients.len());
+
+    removed_oauth_tokens
+        .saturating_add(removed_oauth_health)
+        .saturating_add(removed_registered_clients)
 }
 
 fn now_epoch_seconds() -> u64 {
@@ -729,6 +971,10 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::{
         AuthManager, OAuthServerHealth, OAuthToken, TokenState, prune_token_state_for_server_names,
@@ -768,7 +1014,7 @@ mod tests {
             discovery_url: Some(discovery_url),
             authorize_url: "https://fallback.example/authorize".to_string(),
             token_url: "https://fallback.example/token".to_string(),
-            client_id: "client-id".to_string(),
+            client_id: Some("client-id".to_string()),
             scopes: vec!["read".to_string()],
         };
 
@@ -793,7 +1039,7 @@ mod tests {
             discovery_url: Some("http://127.0.0.1:9/.well-known/openid-configuration".to_string()),
             authorize_url: "https://fallback.example/authorize".to_string(),
             token_url: "https://fallback.example/token".to_string(),
-            client_id: "client-id".to_string(),
+            client_id: Some("client-id".to_string()),
             scopes: vec!["read".to_string()],
         };
 
@@ -865,7 +1111,7 @@ mod tests {
             discovery_url: None,
             authorize_url: "https://example.com/oauth/authorize".to_string(),
             token_url,
-            client_id: "client-id".to_string(),
+            client_id: Some("client-id".to_string()),
             scopes: vec!["read".to_string(), "write".to_string()],
         };
 
@@ -924,6 +1170,7 @@ mod tests {
         let parsed: TokenState = serde_json::from_str("{}").expect("empty json should parse");
         assert!(parsed.oauth_tokens.is_empty());
         assert!(parsed.oauth_health.is_empty());
+        assert!(parsed.registered_clients.is_empty());
     }
 
     #[test]
@@ -958,15 +1205,25 @@ mod tests {
                 next_retry_after_epoch_seconds: Some(2),
             },
         );
+        tokens.registered_clients.insert(
+            "remove".to_string(),
+            super::RegisteredClient {
+                client_id: "client-remove".to_string(),
+                client_secret: None,
+                registration_client_uri: None,
+                registration_access_token: None,
+            },
+        );
 
         let mut allowed = std::collections::HashSet::new();
         allowed.insert("keep".to_string());
         let removed = prune_token_state_for_server_names(&mut tokens, &allowed);
 
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
         assert!(tokens.oauth_tokens.contains_key("keep"));
         assert!(!tokens.oauth_tokens.contains_key("remove"));
         assert!(!tokens.oauth_health.contains_key("remove"));
+        assert!(!tokens.registered_clients.contains_key("remove"));
     }
 
     fn configured_store(oauth_override: Option<OAuthConfig>) -> (tempfile::TempDir, ConfigStore) {
@@ -977,7 +1234,7 @@ mod tests {
             discovery_url: None,
             authorize_url: "https://example.com/oauth/authorize".to_string(),
             token_url: "https://example.com/oauth/token".to_string(),
-            client_id: "client-id".to_string(),
+            client_id: Some("client-id".to_string()),
             scopes: vec!["read".to_string()],
         });
 
@@ -986,12 +1243,179 @@ mod tests {
                 name: "port".to_string(),
                 url: "https://example.com/mcp".to_string(),
                 oauth: Some(oauth),
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             }],
             tool_description_overrides: std::collections::BTreeMap::new(),
         };
         store.replace(cfg).expect("config should persist");
 
         (temp_dir, store)
+    }
+
+    #[tokio::test]
+    async fn start_dynamically_registers_client_and_reuses_persisted_registration() {
+        let (server_url, register_hits, handle) = spawn_dynamic_registration_provider(true).await;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::with_base_dir(temp_dir.path().join("gambi"));
+        store
+            .replace(AppConfig {
+                servers: vec![ServerConfig {
+                    name: "atlassian".to_string(),
+                    url: server_url,
+                    oauth: None,
+                    transport: Default::default(),
+                    exposure_mode: Default::default(),
+                }],
+                tool_description_overrides: std::collections::BTreeMap::new(),
+            })
+            .expect("config should persist");
+
+        let manager = AuthManager::new(store.clone());
+        let started = manager
+            .start("atlassian", "http://127.0.0.1:3333")
+            .await
+            .expect("start should succeed");
+        assert!(started.auth_url.contains("client_id=dynamic-client"));
+        assert_eq!(register_hits.load(Ordering::SeqCst), 1);
+
+        let tokens: TokenState = store.load_tokens().expect("token state should load");
+        let registered = tokens
+            .registered_clients
+            .get("atlassian")
+            .expect("registered client should be persisted");
+        assert_eq!(registered.client_id, "dynamic-client");
+
+        // New manager instance should reuse the persisted registration (no extra register calls).
+        let manager_again = AuthManager::new(store);
+        let _ = manager_again
+            .start("atlassian", "http://127.0.0.1:3333")
+            .await
+            .expect("start should still succeed");
+        assert_eq!(register_hits.load(Ordering::SeqCst), 1);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn start_fails_when_client_id_missing_and_registration_endpoint_unavailable() {
+        let (server_url, register_hits, handle) = spawn_dynamic_registration_provider(false).await;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::with_base_dir(temp_dir.path().join("gambi"));
+        store
+            .replace(AppConfig {
+                servers: vec![ServerConfig {
+                    name: "port".to_string(),
+                    url: server_url,
+                    oauth: None,
+                    transport: Default::default(),
+                    exposure_mode: Default::default(),
+                }],
+                tool_description_overrides: std::collections::BTreeMap::new(),
+            })
+            .expect("config should persist");
+
+        let manager = AuthManager::new(store);
+        let err = manager
+            .start("port", "http://127.0.0.1:3333")
+            .await
+            .expect_err("start should fail without registration endpoint");
+        assert!(
+            err.to_string()
+                .contains("dynamic client registration is not available")
+        );
+        assert_eq!(register_hits.load(Ordering::SeqCst), 0);
+
+        handle.abort();
+    }
+
+    async fn spawn_dynamic_registration_provider(
+        with_registration: bool,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let register_hits = Arc::new(AtomicUsize::new(0));
+        let register_hits_handler = Arc::clone(&register_hits);
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind provider listener");
+        let addr = listener.local_addr().expect("provider listener addr");
+
+        let origin = format!("http://{addr}");
+        let issuer = origin.clone();
+        let authorize_url = format!("{origin}/authorize");
+        let token_url = format!("{origin}/token");
+        let registration_endpoint = format!("{origin}/register");
+
+        let discovery = Router::new().route(
+            "/.well-known/oauth-authorization-server",
+            get(move || {
+                let issuer = issuer.clone();
+                let authorize_url = authorize_url.clone();
+                let token_url = token_url.clone();
+                let registration_endpoint = registration_endpoint.clone();
+                async move {
+                    if with_registration {
+                        Json(json!({
+                            "issuer": issuer,
+                            "authorization_endpoint": authorize_url,
+                            "token_endpoint": token_url,
+                            "registration_endpoint": registration_endpoint,
+                            "grant_types_supported": ["authorization_code", "refresh_token"],
+                            "code_challenge_methods_supported": ["S256"]
+                        }))
+                    } else {
+                        Json(json!({
+                            "issuer": issuer,
+                            "authorization_endpoint": authorize_url,
+                            "token_endpoint": token_url
+                        }))
+                    }
+                }
+            }),
+        );
+
+        let register_route = Router::new().route(
+            "/register",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let hits = Arc::clone(&register_hits_handler);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+
+                    // Minimal validation that the redirect URI was passed through.
+                    let redirect_uris = body
+                        .get("redirect_uris")
+                        .and_then(|value| value.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    assert!(
+                        redirect_uris.iter().any(|value| value
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("/auth/callback")),
+                        "expected redirect_uris to include /auth/callback"
+                    );
+
+                    Json(json!({
+                        "client_id": "dynamic-client",
+                        "registration_client_uri": "https://example.test/client/123"
+                    }))
+                }
+            }),
+        );
+
+        let app = if with_registration {
+            discovery.merge(register_route)
+        } else {
+            discovery
+        };
+
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("{origin}/v1/sse"), register_hits, handle)
     }
 
     async fn spawn_discovery_server(

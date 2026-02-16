@@ -35,8 +35,7 @@ struct AuthStartResponse {
 async fn admin_exposes_oauth_status_and_start_endpoints() -> anyhow::Result<()> {
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
-    let xdg_config_home = temp.path();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     write_config(
@@ -67,7 +66,7 @@ async fn admin_exposes_oauth_status_and_start_endpoints() -> anyhow::Result<()> 
         cmd.arg("--admin-port-file");
         cmd.arg(&admin_port_file);
         cmd.arg("--no-exec");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ().serve(transport).await?;

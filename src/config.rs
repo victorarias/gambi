@@ -128,12 +128,56 @@ impl TokenStorage {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransportMode {
+    #[default]
+    Auto,
+    Sse,
+    StreamableHttp,
+}
+
+impl TransportMode {
+    fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExposureMode {
+    #[default]
+    Passthrough,
+    Compact,
+    NamesOnly,
+    ServerOnly,
+}
+
+impl ExposureMode {
+    fn is_passthrough(&self) -> bool {
+        *self == Self::Passthrough
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::Compact => "compact",
+            Self::NamesOnly => "names-only",
+            Self::ServerOnly => "server-only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerConfig {
     pub name: String,
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthConfig>,
+    #[serde(default, skip_serializing_if = "TransportMode::is_auto")]
+    pub transport: TransportMode,
+    #[serde(default, skip_serializing_if = "ExposureMode::is_passthrough")]
+    pub exposure_mode: ExposureMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,7 +186,8 @@ pub struct OAuthConfig {
     pub discovery_url: Option<String>,
     pub authorize_url: String,
     pub token_url: String,
-    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
 }
@@ -171,6 +216,8 @@ impl AppConfig {
             name,
             url,
             oauth: server.oauth,
+            transport: server.transport,
+            exposure_mode: server.exposure_mode,
         });
         self.servers.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(())
@@ -184,6 +231,22 @@ impl AppConfig {
             self.tool_description_overrides.remove(server_name);
         }
         removed
+    }
+
+    pub fn set_server_exposure_mode(
+        &mut self,
+        server_name: &str,
+        exposure_mode: ExposureMode,
+    ) -> Result<()> {
+        let Some(server) = self
+            .servers
+            .iter_mut()
+            .find(|server| server.name == server_name)
+        else {
+            bail!("unknown server '{server_name}'");
+        };
+        server.exposure_mode = exposure_mode;
+        Ok(())
     }
 
     pub fn set_tool_description_override(
@@ -287,12 +350,18 @@ impl AppConfig {
 
 impl ConfigStore {
     pub fn new_default() -> Result<Self> {
-        let config_root =
-            dirs::config_dir().ok_or_else(|| anyhow!("unable to resolve config directory"))?;
+        let config_dir = match std::env::var_os("GAMBI_CONFIG_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                let config_root = dirs::config_dir()
+                    .ok_or_else(|| anyhow!("unable to resolve config directory"))?;
+                config_root.join("gambi")
+            }
+        };
         let runtime_profile = RuntimeProfile::from_env()?;
         let token_storage = TokenStorePreference::from_env()?.resolve(runtime_profile);
         Ok(Self::with_base_dir_and_storage(
-            config_root.join("gambi"),
+            config_dir,
             runtime_profile,
             token_storage,
         ))
@@ -329,6 +398,10 @@ impl ConfigStore {
 
     pub fn token_store_mode(&self) -> &'static str {
         self.token_storage.as_str()
+    }
+
+    pub fn daemon_state_file(&self) -> PathBuf {
+        self.paths.config_dir.join("daemon.state")
     }
 
     pub fn load(&self) -> Result<AppConfig> {
@@ -654,7 +727,7 @@ fn validate_server_url(raw_url: &str) -> Result<String> {
 fn validate_oauth_config(oauth: &OAuthConfig) -> Result<()> {
     let authorize = oauth.authorize_url.trim();
     let token = oauth.token_url.trim();
-    let client_id = oauth.client_id.trim();
+    let client_id = oauth.client_id.as_deref().map(str::trim);
     let discovery = oauth.discovery_url.as_deref().map(str::trim);
 
     if authorize.is_empty() {
@@ -663,8 +736,10 @@ fn validate_oauth_config(oauth: &OAuthConfig) -> Result<()> {
     if token.is_empty() {
         bail!("oauth token_url cannot be empty");
     }
-    if client_id.is_empty() {
-        bail!("oauth client_id cannot be empty");
+    if let Some(client_id) = client_id
+        && client_id.is_empty()
+    {
+        bail!("oauth client_id cannot be empty when provided");
     }
 
     if let Some(discovery_url) = discovery {
@@ -910,6 +985,8 @@ mod tests {
                     name: "port".to_string(),
                     url: "https://example.com/mcp".to_string(),
                     oauth: None,
+                    transport: Default::default(),
+                    exposure_mode: Default::default(),
                 })
             })
             .expect("add server");
@@ -934,6 +1011,8 @@ mod tests {
             name: "github".to_string(),
             url: "https://example.com".to_string(),
             oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
         })
         .expect("first add should succeed");
 
@@ -942,6 +1021,8 @@ mod tests {
                 name: "github".to_string(),
                 url: "https://example.com/2".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             })
             .expect_err("duplicate add should fail");
 
@@ -957,6 +1038,8 @@ mod tests {
                 name: "bad:name".to_string(),
                 url: "https://example.com".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             })
             .expect_err("name with colon should fail");
         assert!(with_colon.to_string().contains("cannot contain ':'"));
@@ -966,6 +1049,8 @@ mod tests {
                 name: "bad name".to_string(),
                 url: "https://example.com".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             })
             .expect_err("name with whitespace should fail");
         assert!(with_space.to_string().contains("whitespace"));
@@ -980,6 +1065,8 @@ mod tests {
                 name: "port".to_string(),
                 url: "ftp://example.com".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             })
             .expect_err("bad scheme should fail");
         assert!(
@@ -993,6 +1080,8 @@ mod tests {
                 name: "stdio-bad".to_string(),
                 url: "stdio:///".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             })
             .expect_err("empty stdio command should fail");
         assert!(
@@ -1005,6 +1094,8 @@ mod tests {
             name: "stdio".to_string(),
             url: "stdio://local-server".to_string(),
             oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
         })
         .expect("stdio transport should be allowed");
     }
@@ -1016,6 +1107,8 @@ mod tests {
             name: "port".to_string(),
             url: "https://example.com/mcp".to_string(),
             oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
         })
         .expect("valid server should be added");
 
@@ -1041,6 +1134,8 @@ mod tests {
             name: "github".to_string(),
             url: "https://example.com/mcp".to_string(),
             oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
         })
         .expect("valid server should be added");
 
@@ -1076,9 +1171,11 @@ mod tests {
                     discovery_url: Some("ftp://example.com/discovery".to_string()),
                     authorize_url: "https://example.com/authorize".to_string(),
                     token_url: "https://example.com/token".to_string(),
-                    client_id: "client".to_string(),
+                    client_id: Some("client".to_string()),
                     scopes: vec!["read".to_string()],
                 }),
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             })
             .expect_err("invalid oauth discovery URL must fail");
         assert!(bad_discovery.to_string().contains("oauth discovery_url"));
@@ -1091,9 +1188,11 @@ mod tests {
                     discovery_url: None,
                     authorize_url: "not-a-url".to_string(),
                     token_url: "https://example.com/token".to_string(),
-                    client_id: "client".to_string(),
+                    client_id: Some("client".to_string()),
                     scopes: vec!["read".to_string()],
                 }),
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             })
             .expect_err("invalid oauth config must fail");
         assert!(bad.to_string().contains("invalid oauth authorize_url"));
@@ -1107,9 +1206,11 @@ mod tests {
                 ),
                 authorize_url: "https://example.com/authorize".to_string(),
                 token_url: "https://example.com/token".to_string(),
-                client_id: "client".to_string(),
+                client_id: Some("client".to_string()),
                 scopes: vec!["read".to_string(), "write".to_string()],
             }),
+            transport: Default::default(),
+            exposure_mode: Default::default(),
         })
         .expect("valid oauth config should succeed");
     }
@@ -1144,6 +1245,8 @@ mod tests {
             name: "port".to_string(),
             url: "https://example.com/mcp".to_string(),
             oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
         })
         .expect("valid config");
 
@@ -1156,6 +1259,8 @@ mod tests {
                 name: "bad:name".to_string(),
                 url: "https://example.com".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             }],
             tool_description_overrides: BTreeMap::new(),
         };
@@ -1179,6 +1284,8 @@ mod tests {
                         name: format!("server-{idx}"),
                         url: format!("https://example.com/{idx}"),
                         oauth: None,
+                        transport: Default::default(),
+                        exposure_mode: Default::default(),
                     })
                 })
             }));
@@ -1227,6 +1334,8 @@ mod tests {
                 name: "port".to_string(),
                 url: "https://example.com/mcp".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             }],
             tool_description_overrides: BTreeMap::new(),
         };

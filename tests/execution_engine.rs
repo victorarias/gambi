@@ -298,8 +298,7 @@ async fn spawn_gambi_with_fixture(
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path().to_path_buf();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     let fixture_url = format!("stdio:///{bin}?arg=__fixture_progress_server", bin = bin);
@@ -316,7 +315,7 @@ async fn spawn_gambi_with_fixture(
         cmd.arg("serve");
         cmd.arg("--admin-port");
         cmd.arg("0");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
         for (key, value) in &extra_env {
             cmd.env(key, value);
         }

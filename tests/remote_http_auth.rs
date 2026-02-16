@@ -21,9 +21,31 @@ use rmcp::{
         },
     },
 };
+use serde::Deserialize;
 use serde_json::{Map, json};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Deserialize)]
+struct ExecuteResponse {
+    result: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelpToolSummary {
+    namespaced_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelpServerSummary {
+    name: String,
+    tools: Vec<HelpToolSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelpResponse {
+    servers: Vec<HelpServerSummary>,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RemoteFixture;
@@ -90,35 +112,41 @@ async fn gambi_routes_http_upstream_with_bearer_token() -> anyhow::Result<()> {
 
     let tools = client.list_all_tools().await?;
     assert!(
+        tools.iter().any(|tool| tool.name.as_ref() == "gambi_help"),
+        "expected gambi_help to be listed"
+    );
+    assert!(
         tools
             .iter()
-            .any(|tool| tool.name.as_ref() == "remote:remote_echo"),
-        "expected remote namespaced tool to be listed"
+            .any(|tool| tool.name.as_ref() == "gambi_execute"),
+        "expected gambi_execute to be listed"
     );
 
-    let result = client
-        .call_tool(CallToolRequestParams {
-            meta: None,
-            name: "remote:remote_echo".to_string().into(),
-            arguments: Some(
-                json!({
-                    "message": "hello-http",
-                    "count": 2
-                })
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
-            ),
-            task: None,
-        })
-        .await?;
+    let help = help(&client, Some("remote")).await?;
+    let remote = help
+        .servers
+        .iter()
+        .find(|server| server.name == "remote")
+        .ok_or_else(|| anyhow::anyhow!("remote server missing from gambi_help"))?;
+    assert!(
+        remote
+            .tools
+            .iter()
+            .any(|tool| tool.namespaced_name == "remote:remote_echo"),
+        "expected remote:remote_echo in gambi_help discovery"
+    );
 
-    let payload = result
-        .structured_content
-        .ok_or_else(|| anyhow::anyhow!("missing structured payload"))?;
-    assert_eq!(payload["source"], "remote");
-    assert_eq!(payload["echo"]["message"], "hello-http");
-    assert_eq!(payload["echo"]["count"], 2);
+    let output = execute(
+        &client,
+        r#"
+result = remote.remote_echo(message="hello-http", count=2)
+return result
+"#,
+    )
+    .await?;
+    assert_eq!(output.result["source"], "remote");
+    assert_eq!(output.result["echo"]["message"], "hello-http");
+    assert_eq!(output.result["echo"]["count"], 2);
 
     remote_shutdown.cancel();
     let _ = remote_handle.await;
@@ -134,14 +162,7 @@ async fn gambi_reconnects_http_upstream_after_remote_restart() -> anyhow::Result
     let (client, _temp) = spawn_gambi_with_remote(remote_port).await?;
 
     // Prime initial connection.
-    let _ = client
-        .call_tool(CallToolRequestParams {
-            meta: None,
-            name: "remote:remote_echo".to_string().into(),
-            arguments: None,
-            task: None,
-        })
-        .await?;
+    let _ = execute(&client, "return remote.remote_echo()").await?;
 
     first_shutdown.cancel();
     let _ = first_handle.await;
@@ -153,20 +174,9 @@ async fn gambi_reconnects_http_upstream_after_remote_restart() -> anyhow::Result
 
     let mut succeeded = false;
     for _attempt in 0..5 {
-        match client
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: "remote:remote_echo".to_string().into(),
-                arguments: None,
-                task: None,
-            })
-            .await
-        {
-            Ok(value) => {
-                let payload = value
-                    .structured_content
-                    .ok_or_else(|| anyhow::anyhow!("missing structured payload"))?;
-                assert_eq!(payload["source"], "remote");
+        match execute(&client, "return remote.remote_echo()").await {
+            Ok(output) => {
+                assert_eq!(output.result["source"], "remote");
                 succeeded = true;
                 break;
             }
@@ -211,7 +221,24 @@ async fn spawn_authenticated_remote_server(
             require_bearer(req, next, token)
         }));
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let listener = {
+        let mut attempts = 0u32;
+        loop {
+            match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => break listener,
+                Err(err) if port != 0 && attempts < 200 => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tracing::debug!(
+                        error = %err,
+                        attempts,
+                        "retrying authenticated remote bind on preferred port"
+                    );
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    };
     let bound_port = listener.local_addr()?.port();
     let handle = tokio::spawn({
         let shutdown = shutdown.clone();
@@ -252,8 +279,7 @@ async fn spawn_gambi_with_remote(
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path().to_path_buf();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     write_config(
@@ -296,12 +322,97 @@ async fn spawn_gambi_with_remote(
         cmd.arg("serve");
         cmd.arg("--admin-port");
         cmd.arg("0");
-        cmd.arg("--no-exec");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ().serve(transport).await?;
     Ok((client, temp))
+}
+
+async fn execute(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    code: &str,
+) -> anyhow::Result<ExecuteResponse> {
+    let result = client
+        .call_tool(CallToolRequestParams {
+            meta: None,
+            name: "gambi_execute".to_string().into(),
+            arguments: Some(
+                json!({ "code": code })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            task: None,
+        })
+        .await?;
+
+    if result.is_error.unwrap_or(false) {
+        let first_text = result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_else(|| "gambi_execute returned an error".to_string());
+        anyhow::bail!(first_text);
+    }
+
+    if let Some(structured) = result.structured_content {
+        return Ok(serde_json::from_value(structured)?);
+    }
+
+    let first_text = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .map(|text| text.text.clone())
+        .ok_or_else(|| anyhow::anyhow!("gambi_execute did not return parseable output"))?;
+
+    Ok(serde_json::from_str(&first_text)?)
+}
+
+async fn help(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    server: Option<&str>,
+) -> anyhow::Result<HelpResponse> {
+    let arguments = server.map(|name| {
+        json!({ "server": name })
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+    });
+
+    let result = client
+        .call_tool(CallToolRequestParams {
+            meta: None,
+            name: "gambi_help".to_string().into(),
+            arguments,
+            task: None,
+        })
+        .await?;
+
+    if result.is_error.unwrap_or(false) {
+        let first_text = result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_else(|| "gambi_help returned an error".to_string());
+        anyhow::bail!(first_text);
+    }
+
+    if let Some(structured) = result.structured_content {
+        return Ok(serde_json::from_value(structured)?);
+    }
+
+    let first_text = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .map(|text| text.text.clone())
+        .ok_or_else(|| anyhow::anyhow!("gambi_help did not return parseable output"))?;
+
+    Ok(serde_json::from_str(&first_text)?)
 }
 
 fn write_config(path: &Path, contents: &str) -> anyhow::Result<()> {

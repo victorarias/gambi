@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use rmcp::{
@@ -17,10 +21,10 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::auth::TokenState;
-use crate::config::ConfigStore;
+use crate::config::{ConfigStore, ExposureMode};
 use crate::execution::{self, ExecuteOutput};
 use crate::namespacing::{
     namespaced_resource_uri, parse_namespaced_resource_uri, split_namespaced,
@@ -28,11 +32,13 @@ use crate::namespacing::{
 use crate::upstream;
 
 const AGGREGATED_PAGE_SIZE: usize = 100;
+const COMPACT_DESCRIPTION_LIMIT: usize = 180;
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct ListedServer {
     name: String,
     url: String,
+    exposure_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -70,6 +76,50 @@ struct ExecuteResponse {
     tool_calls: usize,
     elapsed_ms: u128,
     stdout: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct HelpRequest {
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct HelpToolSummaryOutput {
+    namespaced_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct HelpServerOutput {
+    name: String,
+    url: String,
+    exposure_mode: String,
+    tool_count: usize,
+    tools: Vec<HelpToolSummaryOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct HelpToolDetailOutput {
+    namespaced_name: String,
+    server: String,
+    upstream_name: String,
+    description: String,
+    input_schema: Map<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_schema: Option<Map<String, Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct HelpResponse {
+    usage: String,
+    servers: Vec<HelpServerOutput>,
+    failures: Vec<UpstreamFailureOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<HelpToolDetailOutput>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,15 +161,26 @@ impl McpServer {
 
     #[tool(
         name = "gambi_list_upstream_tools",
-        description = "Discover tools from configured upstream MCP servers"
+        description = "Discover upstream tool names and discovery failures for troubleshooting"
     )]
     async fn gambi_list_upstream_tools(&self) -> Result<Json<UpstreamDiscoveryOutput>, String> {
         list_upstream_tools_output(&self.store, &self.upstream).await
     }
 
     #[tool(
+        name = "gambi_help",
+        description = "Explain upstream MCP capabilities and return full tool metadata on demand (execute-only workflow)"
+    )]
+    async fn gambi_help(
+        &self,
+        Parameters(params): Parameters<HelpRequest>,
+    ) -> Result<Json<HelpResponse>, String> {
+        gambi_help_output(&self.store, &self.upstream, params).await
+    }
+
+    #[tool(
         name = "gambi_execute",
-        description = "Execute Python workflow in gambi (Monty runtime) with tool-call bridge and resource limits"
+        description = "Primary execution path: run Python workflow in gambi (Monty runtime) with upstream tool-call bridge and resource limits"
     )]
     async fn gambi_execute(
         &self,
@@ -147,9 +208,13 @@ impl McpServer {
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.exec_enabled {
-            "gambi aggregates upstream MCP capabilities and exposes gambi_execute by default"
+            "gambi execute-only mode:\n\
+             1. Call gambi_help to inspect servers/tools and get full tool metadata.\n\
+             2. Call gambi_execute for all upstream work; direct namespaced tool calls are disabled.\n\
+             3. If discovery is sparse, call gambi_list_upstream_tools for diagnostics."
         } else {
-            "gambi aggregates upstream MCP capabilities with execution disabled (--no-exec)"
+            "gambi execute-only mode with execution disabled (--no-exec):\n\
+             Use gambi_help to inspect available upstream capabilities. Direct namespaced tool calls are disabled."
         };
 
         ServerInfo {
@@ -168,7 +233,7 @@ impl ServerHandler for McpServer {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        merged_list_tools(self.local_tools(), &self.store, &self.upstream, request).await
+        local_list_tools(self.local_tools(), request).await
     }
 
     async fn call_tool(
@@ -180,15 +245,7 @@ impl ServerHandler for McpServer {
             return Err(McpError::method_not_found::<CallToolRequestMethod>());
         }
 
-        route_tool_call(
-            self,
-            &self.tool_router,
-            &self.store,
-            &self.upstream,
-            request,
-            context,
-        )
-        .await
+        route_tool_call(self, &self.tool_router, request, context).await
     }
 
     async fn list_prompts(
@@ -247,66 +304,38 @@ fn schema_compat_normalization_enabled() -> bool {
     std::env::var("GAMBI_TOOL_SCHEMA_COMPAT_NORMALIZATION")
         .ok()
         .map(|value| {
-            matches!(
+            !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes"
+                "0" | "false" | "no"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
-async fn merged_list_tools(
+async fn local_list_tools(
     mut tools: Vec<Tool>,
-    store: &ConfigStore,
-    upstream_manager: &upstream::UpstreamManager,
     request: Option<PaginatedRequestParams>,
 ) -> Result<ListToolsResult, McpError> {
-    if upstream_discovery_enabled_for_mcp_listing() {
-        let cfg = store.load_async().await.map_err(|err| {
-            McpError::internal_error(
-                format!("failed to load config for tool listing: {err}"),
-                None,
-            )
-        })?;
-        let auth_headers = load_upstream_auth_headers(store).await?;
-
-        let discovered = upstream_manager
-            .discover_tools_from_servers(&cfg.servers, &auth_headers)
-            .await
-            .map_err(|err| {
-                McpError::internal_error(
-                    format!("failed to discover upstream tools for listing: {err:#}"),
-                    None,
-                )
-            })?;
-
-        for failure in discovered.failures {
-            warn!(
-                server = %failure.server_name,
-                error = %failure.message,
-                "upstream tool discovery failed during list_tools"
-            );
-        }
-
-        for discovered_tool in discovered.tools {
-            let mut tool = discovered_tool.tool;
-            if let Some(description) = cfg.tool_description_override_for(
-                &discovered_tool.server_name,
-                &discovered_tool.upstream_name,
-            ) {
-                tool.description = Some(description.to_string().into());
-            }
-            tools.push(tool);
-        }
-    }
-
+    let cursor_offset = parse_cursor_offset(request.as_ref())?;
+    let local_tool_count = tools.len();
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     tools.dedup_by(|a, b| a.name == b.name);
     if schema_compat_normalization_enabled() {
         tools.iter_mut().for_each(normalize_tool_schema_for_clients);
     }
 
+    let total_tool_count = tools.len();
     let (tools, next_cursor) = paginate_items(tools, request)?;
+
+    if cursor_offset == 0 {
+        info!(
+            local_tool_count,
+            total_tool_count,
+            page_tool_count = tools.len(),
+            next_cursor = next_cursor.as_deref().unwrap_or(""),
+            "mcp tools/list response prepared"
+        );
+    }
 
     Ok(ListToolsResult {
         meta: None,
@@ -345,20 +374,53 @@ fn normalize_to_object_root(schema: &Map<String, Value>) -> Map<String, Value> {
 fn normalize_schema_fragments(schema: &Map<String, Value>) -> Map<String, Value> {
     let mut normalized = Map::new();
     for (key, value) in schema {
-        let next = match value {
-            Value::Object(map) => Value::Object(normalize_schema_fragments(map)),
-            Value::Array(items) => Value::Array(
-                items
-                    .iter()
-                    .map(|item| match item {
-                        Value::Object(map) => Value::Object(normalize_schema_fragments(map)),
-                        other => other.clone(),
-                    })
-                    .collect(),
-            ),
-            // Preserve JSON Schema boolean fragments to avoid weakening upstream semantics.
-            Value::Bool(_) => value.clone(),
-            other => other.clone(),
+        let next = if key == "properties" {
+            match value {
+                Value::Object(properties) => {
+                    let mut normalized_properties = Map::new();
+                    for (property_name, property_schema) in properties {
+                        let normalized_property_schema = match property_schema {
+                            Value::Object(map) => Value::Object(normalize_schema_fragments(map)),
+                            // Some clients reject tools/list if any property schema is bare
+                            // true/false. Replace with {} (accept-any object schema).
+                            Value::Bool(_) => Value::Object(Map::new()),
+                            Value::Array(items) => Value::Array(
+                                items
+                                    .iter()
+                                    .map(|item| match item {
+                                        Value::Object(map) => {
+                                            Value::Object(normalize_schema_fragments(map))
+                                        }
+                                        other => other.clone(),
+                                    })
+                                    .collect(),
+                            ),
+                            other => other.clone(),
+                        };
+                        normalized_properties
+                            .insert(property_name.clone(), normalized_property_schema);
+                    }
+                    Value::Object(normalized_properties)
+                }
+                other => other.clone(),
+            }
+        } else {
+            match value {
+                Value::Object(map) => Value::Object(normalize_schema_fragments(map)),
+                Value::Array(items) => Value::Array(
+                    items
+                        .iter()
+                        .map(|item| match item {
+                            Value::Object(map) => Value::Object(normalize_schema_fragments(map)),
+                            other => other.clone(),
+                        })
+                        .collect(),
+                ),
+                // Preserve JSON Schema booleans outside properties (e.g. nullable flags,
+                // additionalProperties) to avoid changing meaning unnecessarily.
+                Value::Bool(_) => value.clone(),
+                other => other.clone(),
+            }
         };
         normalized.insert(key.clone(), next);
     }
@@ -532,8 +594,6 @@ async fn merged_list_resource_templates(
 async fn route_tool_call<S>(
     service: &S,
     tool_router: &ToolRouter<S>,
-    store: &ConfigStore,
-    upstream_manager: &upstream::UpstreamManager,
     request: CallToolRequestParams,
     context: RequestContext<RoleServer>,
 ) -> Result<CallToolResult, McpError>
@@ -547,49 +607,13 @@ where
     }
 
     let tool_name = request.name.clone().into_owned();
-    let Some((server_name, upstream_tool_name)) = split_namespaced(&tool_name) else {
-        return Err(McpError::method_not_found::<CallToolRequestMethod>());
-    };
-
-    let cfg = store.load_async().await.map_err(|err| {
-        McpError::internal_error(
-            format!("failed to load config for tool call routing: {err}"),
-            None,
-        )
-    })?;
-    let auth_headers = load_upstream_auth_headers(store).await?;
-
-    let Some(server) = cfg
-        .servers
-        .iter()
-        .find(|candidate| candidate.name == server_name)
-    else {
+    if split_namespaced(&tool_name).is_some() {
         return Err(McpError::invalid_params(
-            format!("unknown tool namespace '{server_name}'"),
+            "direct upstream tool invocation is disabled; use gambi_help then gambi_execute",
             None,
         ));
-    };
-
-    let mut upstream_request = request;
-    upstream_request.name = upstream_tool_name.to_string().into();
-    merge_request_meta(&mut upstream_request.meta, &context.meta);
-    map_upstream_request_error(
-        upstream_manager
-            .call_tool_on_server(
-                server,
-                &auth_headers,
-                upstream_request,
-                context.ct,
-                context
-                    .meta
-                    .get_progress_token()
-                    .map(|token| upstream::ProgressForwarder::new(context.peer.clone(), token)),
-            )
-            .await,
-        "tool",
-        server_name,
-        upstream_tool_name,
-    )
+    }
+    Err(McpError::method_not_found::<CallToolRequestMethod>())
 }
 
 async fn route_get_prompt(
@@ -855,6 +879,7 @@ async fn list_servers_output(store: &ConfigStore) -> Result<Json<ListServersOutp
         .map(|server| ListedServer {
             name: server.name,
             url: server.url,
+            exposure_mode: server.exposure_mode.as_str().to_string(),
         })
         .collect();
 
@@ -866,13 +891,7 @@ async fn list_upstream_tools_output(
     upstream_manager: &upstream::UpstreamManager,
 ) -> Result<Json<UpstreamDiscoveryOutput>, String> {
     let cfg = store.load_async().await.map_err(|err| err.to_string())?;
-    let tokens: TokenState = store
-        .load_tokens_async()
-        .await
-        .map_err(|err| err.to_string())?;
-    let auth_headers = upstream::auth_headers_from_token_state(&tokens);
-    let discovered = upstream_manager
-        .discover_tools_from_servers(&cfg.servers, &auth_headers)
+    let discovered = discover_tools_with_auto_refresh(store, upstream_manager, &cfg.servers)
         .await
         .map_err(|err| err.to_string())?;
 
@@ -895,6 +914,252 @@ async fn list_upstream_tools_output(
         .collect();
 
     Ok(Json(UpstreamDiscoveryOutput { tools, failures }))
+}
+
+async fn gambi_help_output(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    request: HelpRequest,
+) -> Result<Json<HelpResponse>, String> {
+    let cfg = store.load_async().await.map_err(|err| err.to_string())?;
+
+    let selected_servers = select_help_servers(&cfg, request.server.as_deref())?;
+    let discovery = discover_tools_with_auto_refresh(store, upstream_manager, &selected_servers)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let mut by_server = BTreeMap::<String, Vec<upstream::DiscoveredTool>>::new();
+    for tool in discovery.tools {
+        by_server
+            .entry(tool.server_name.clone())
+            .or_default()
+            .push(tool);
+    }
+    for tools in by_server.values_mut() {
+        tools.sort_by(|a, b| a.namespaced_name.cmp(&b.namespaced_name));
+    }
+
+    let selected_server_name = request.server.as_deref();
+    let selected_tool_detail = if let Some(raw_tool) = request.tool.as_deref() {
+        let selected = resolve_help_tool(raw_tool, selected_server_name, &by_server)?;
+        Some(HelpToolDetailOutput {
+            namespaced_name: selected.namespaced_name.clone(),
+            server: selected.server_name.clone(),
+            upstream_name: selected.upstream_name.clone(),
+            description: effective_tool_description(&cfg, selected),
+            input_schema: selected.tool.input_schema.as_ref().clone(),
+            output_schema: selected
+                .tool
+                .output_schema
+                .as_ref()
+                .map(|schema| schema.as_ref().clone()),
+        })
+    } else {
+        None
+    };
+
+    let mut servers = Vec::new();
+    for server in selected_servers {
+        let discovered = by_server.get(&server.name).cloned().unwrap_or_default();
+        let tool_count = discovered.len();
+        let tools = summarize_tools_for_exposure_mode(&cfg, &server, &discovered);
+        servers.push(HelpServerOutput {
+            name: server.name.clone(),
+            url: server.url.clone(),
+            exposure_mode: server.exposure_mode.as_str().to_string(),
+            tool_count,
+            tools,
+        });
+    }
+
+    let failures = discovery
+        .failures
+        .into_iter()
+        .map(|failure| UpstreamFailureOutput {
+            server: failure.server_name,
+            error: failure.message,
+        })
+        .collect::<Vec<_>>();
+
+    let usage = "Use gambi in execute-only mode:\n\
+1) Call gambi_help to inspect servers/tools.\n\
+2) If you need full metadata, call gambi_help with server/tool.\n\
+3) Run upstream workflows only through gambi_execute.\n\
+Direct namespaced upstream tool calls are disabled."
+        .to_string();
+
+    Ok(Json(HelpResponse {
+        usage,
+        servers,
+        failures,
+        tool: selected_tool_detail,
+    }))
+}
+
+fn select_help_servers(
+    cfg: &crate::config::AppConfig,
+    selected_server_name: Option<&str>,
+) -> Result<Vec<crate::config::ServerConfig>, String> {
+    let mut servers = cfg.servers.clone();
+    if let Some(server_name) = selected_server_name {
+        servers.retain(|server| server.name == server_name);
+        if servers.is_empty() {
+            return Err(format!("unknown server '{server_name}'"));
+        }
+    }
+    Ok(servers)
+}
+
+fn resolve_help_tool<'a>(
+    raw_tool: &str,
+    selected_server_name: Option<&str>,
+    by_server: &'a BTreeMap<String, Vec<upstream::DiscoveredTool>>,
+) -> Result<&'a upstream::DiscoveredTool, String> {
+    if let Some((server_name, upstream_tool_name)) = split_namespaced(raw_tool) {
+        let Some(tools) = by_server.get(server_name) else {
+            return Err(format!("unknown server '{server_name}'"));
+        };
+        return tools
+            .iter()
+            .find(|tool| tool.upstream_name == upstream_tool_name)
+            .ok_or_else(|| format!("unknown tool '{raw_tool}'"));
+    }
+
+    let mut matches = Vec::new();
+    for (server_name, tools) in by_server {
+        if selected_server_name.is_some_and(|selected| selected != server_name) {
+            continue;
+        }
+        for tool in tools {
+            if tool.upstream_name == raw_tool || tool.namespaced_name == raw_tool {
+                matches.push(tool);
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Err(format!("unknown tool '{raw_tool}'")),
+        1 => Ok(matches[0]),
+        _ => Err(format!(
+            "tool '{raw_tool}' is ambiguous across servers; specify '<server>:<tool>'"
+        )),
+    }
+}
+
+fn summarize_tools_for_exposure_mode(
+    cfg: &crate::config::AppConfig,
+    server: &crate::config::ServerConfig,
+    discovered: &[upstream::DiscoveredTool],
+) -> Vec<HelpToolSummaryOutput> {
+    if server.exposure_mode == ExposureMode::ServerOnly {
+        return Vec::new();
+    }
+
+    discovered
+        .iter()
+        .map(|tool| {
+            let effective = effective_tool_description(cfg, tool);
+            let description = match server.exposure_mode {
+                ExposureMode::Passthrough => (!effective.is_empty()).then_some(effective),
+                ExposureMode::Compact => {
+                    (!effective.is_empty()).then_some(truncate_description(&effective))
+                }
+                ExposureMode::NamesOnly => None,
+                ExposureMode::ServerOnly => None,
+            };
+            HelpToolSummaryOutput {
+                namespaced_name: tool.namespaced_name.clone(),
+                description,
+            }
+        })
+        .collect()
+}
+
+fn effective_tool_description(
+    cfg: &crate::config::AppConfig,
+    tool: &upstream::DiscoveredTool,
+) -> String {
+    cfg.tool_description_override_for(&tool.server_name, &tool.upstream_name)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            tool.tool
+                .description
+                .as_ref()
+                .map(|description| description.to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn truncate_description(description: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in description.chars().enumerate() {
+        if index >= COMPACT_DESCRIPTION_LIMIT {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+async fn discover_tools_with_auto_refresh(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    servers: &[crate::config::ServerConfig],
+) -> Result<upstream::DiscoveryResult> {
+    let tokens: TokenState = store.load_tokens_async().await?;
+    let auth_headers = upstream::auth_headers_from_token_state(&tokens);
+    let mut discovered = upstream_manager
+        .discover_tools_from_servers(servers, &auth_headers)
+        .await?;
+
+    let invalid_token_failures: BTreeSet<String> = discovered
+        .failures
+        .iter()
+        .filter(|failure| looks_like_invalid_token(&failure.message))
+        .map(|failure| failure.server_name.clone())
+        .collect();
+    if invalid_token_failures.is_empty() {
+        return Ok(discovered);
+    }
+
+    let auth = crate::auth::AuthManager::new(store.clone());
+    let mut refreshed_any = false;
+    for server_name in invalid_token_failures {
+        match auth.refresh(&server_name).await {
+            Ok(response) => {
+                info!(
+                    server = %server_name,
+                    refreshed = response.refreshed,
+                    expires_at_epoch_seconds = ?response.expires_at_epoch_seconds,
+                    "upstream reported invalid_token during MCP discovery; oauth refresh succeeded"
+                );
+                refreshed_any = true;
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    server = %server_name,
+                    "upstream reported invalid_token during MCP discovery and oauth refresh failed"
+                );
+            }
+        }
+    }
+
+    if refreshed_any {
+        upstream_manager.invalidate_discovery_cache().await;
+        let tokens: TokenState = store.load_tokens_async().await?;
+        let auth_headers = upstream::auth_headers_from_token_state(&tokens);
+        discovered = upstream_manager
+            .discover_tools_from_servers(servers, &auth_headers)
+            .await?;
+    }
+
+    Ok(discovered)
+}
+
+fn looks_like_invalid_token(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("invalid_token")
 }
 
 #[cfg(test)]
@@ -1003,16 +1268,13 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tool_schema_preserves_boolean_subschemas() {
+    fn normalize_tool_schema_sanitizes_boolean_property_schemas() {
         let mut input_schema = Map::new();
         input_schema.insert("type".to_string(), Value::String("object".to_string()));
         input_schema.insert("additionalProperties".to_string(), Value::Bool(false));
-        let mut nested = Map::new();
-        nested.insert(
-            "anyOf".to_string(),
-            Value::Array(vec![Value::Bool(true), Value::Object(Map::new())]),
-        );
-        input_schema.insert("properties".to_string(), Value::Object(nested));
+        let mut properties = Map::new();
+        properties.insert("result".to_string(), Value::Bool(true));
+        input_schema.insert("properties".to_string(), Value::Object(properties));
         let mut tool = Tool::new("example_tool", "example", Arc::new(input_schema));
 
         normalize_tool_schema_for_clients(&mut tool);
@@ -1023,13 +1285,13 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false)
         );
-        let any_of_items = tool
+        let result_schema = tool
             .input_schema
             .get("properties")
             .and_then(Value::as_object)
-            .and_then(|properties| properties.get("anyOf"))
-            .and_then(Value::as_array)
-            .expect("anyOf array should exist");
-        assert_eq!(any_of_items.first().and_then(Value::as_bool), Some(true));
+            .and_then(|properties| properties.get("result"))
+            .and_then(Value::as_object)
+            .expect("result schema should be object after normalization");
+        assert!(result_schema.is_empty());
     }
 }

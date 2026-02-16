@@ -5,15 +5,43 @@ use rmcp::{
     model::{CallToolRequestParams, ErrorCode, PaginatedRequestParams},
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
 use tokio::process::Command;
+
+#[derive(Debug, Deserialize)]
+struct HelpToolSummary {
+    namespaced_name: String,
+    #[allow(dead_code)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelpServerSummary {
+    name: String,
+    tools: Vec<HelpToolSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelpToolDetail {
+    #[allow(dead_code)]
+    namespaced_name: String,
+    description: String,
+    input_schema: Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelpResponse {
+    servers: Vec<HelpServerSummary>,
+    tool: Option<HelpToolDetail>,
+}
 
 #[tokio::test]
 async fn gambi_routes_namespaced_upstream_stdio_tool_calls() -> anyhow::Result<()> {
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     let self_url = format!(
@@ -34,28 +62,45 @@ async fn gambi_routes_namespaced_upstream_stdio_tool_calls() -> anyhow::Result<(
         cmd.arg("serve");
         cmd.arg("--admin-port");
         cmd.arg("0");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ().serve(transport).await?;
 
     let tools = client.list_all_tools().await?;
+    assert!(tools.iter().any(|tool| tool.name.as_ref() == "gambi_help"));
+    let help = gambi_help(&client, Some("self"), None).await?;
+    let self_server = help
+        .servers
+        .iter()
+        .find(|server| server.name == "self")
+        .expect("self server should exist");
     assert!(
-        tools
+        self_server
+            .tools
             .iter()
-            .any(|tool| tool.name.as_ref() == "self:gambi_list_servers")
+            .any(|tool| tool.namespaced_name == "self:gambi_list_servers")
     );
 
-    let routed = client
+    let err = client
         .call_tool(CallToolRequestParams {
             meta: None,
             name: "self:gambi_list_servers".to_string().into(),
             arguments: None,
             task: None,
         })
-        .await?;
-
-    assert!(routed.structured_content.is_some());
+        .await
+        .expect_err("direct namespaced invocation must be rejected");
+    match err {
+        ServiceError::McpError(data) => {
+            assert_eq!(data.code, ErrorCode::INVALID_PARAMS);
+            assert!(
+                data.message
+                    .contains("direct upstream tool invocation is disabled")
+            );
+        }
+        other => panic!("expected MCP invalid params error, got: {other}"),
+    }
 
     let _ = client.cancel().await;
     Ok(())
@@ -66,8 +111,7 @@ async fn gambi_preserves_upstream_mcp_error_codes_for_routed_calls() -> anyhow::
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     let self_url = format!(
@@ -88,7 +132,7 @@ async fn gambi_preserves_upstream_mcp_error_codes_for_routed_calls() -> anyhow::
         cmd.arg("serve");
         cmd.arg("--admin-port");
         cmd.arg("0");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ().serve(transport).await?;
@@ -104,9 +148,10 @@ async fn gambi_preserves_upstream_mcp_error_codes_for_routed_calls() -> anyhow::
 
     match err {
         ServiceError::McpError(data) => {
-            assert_ne!(data.code, ErrorCode::INTERNAL_ERROR);
+            assert_eq!(data.code, ErrorCode::INVALID_PARAMS);
             assert!(
-                data.code == ErrorCode::INVALID_PARAMS || data.code == ErrorCode::METHOD_NOT_FOUND
+                data.message
+                    .contains("direct upstream tool invocation is disabled")
             );
         }
         other => panic!("expected MCP protocol error, got: {other}"),
@@ -121,8 +166,7 @@ async fn gambi_rejects_invalid_list_cursor_with_mcp_invalid_params() -> anyhow::
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
     write_config(
         &gambi_config_dir.join("config.json"),
@@ -135,7 +179,7 @@ async fn gambi_rejects_invalid_list_cursor_with_mcp_invalid_params() -> anyhow::
         cmd.arg("--admin-port");
         cmd.arg("0");
         cmd.arg("--no-exec");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ().serve(transport).await?;
@@ -164,8 +208,7 @@ async fn gambi_preserves_input_schema_for_namespaced_tools() -> anyhow::Result<(
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     let self_url = format!(
@@ -186,7 +229,7 @@ async fn gambi_preserves_input_schema_for_namespaced_tools() -> anyhow::Result<(
         cmd.arg("serve");
         cmd.arg("--admin-port");
         cmd.arg("0");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ().serve(transport).await?;
@@ -196,12 +239,10 @@ async fn gambi_preserves_input_schema_for_namespaced_tools() -> anyhow::Result<(
         .iter()
         .find(|tool| tool.name.as_ref() == "gambi_list_servers")
         .expect("local tool should exist");
-    let namespaced = tools
-        .iter()
-        .find(|tool| tool.name.as_ref() == "self:gambi_list_servers")
-        .expect("namespaced upstream tool should exist");
+    let help = gambi_help(&client, Some("self"), Some("self:gambi_list_servers")).await?;
+    let detail = help.tool.expect("expected tool detail in gambi_help");
 
-    assert_eq!(local.input_schema, namespaced.input_schema);
+    assert_eq!(local.input_schema.as_ref(), &detail.input_schema);
 
     let _ = client.cancel().await;
     Ok(())
@@ -212,8 +253,7 @@ async fn gambi_applies_configured_tool_description_overrides() -> anyhow::Result
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     let self_url = format!(
@@ -243,24 +283,66 @@ async fn gambi_applies_configured_tool_description_overrides() -> anyhow::Result
         cmd.arg("serve");
         cmd.arg("--admin-port");
         cmd.arg("0");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ().serve(transport).await?;
-    let tools = client.list_all_tools().await?;
+    let help = gambi_help(&client, Some("self"), Some("self:gambi_list_servers")).await?;
+    let namespaced = help.tool.expect("expected tool detail in gambi_help");
 
-    let namespaced = tools
-        .iter()
-        .find(|tool| tool.name.as_ref() == "self:gambi_list_servers")
-        .expect("namespaced upstream tool should exist");
-
-    assert_eq!(
-        namespaced.description.as_deref(),
-        Some("Custom server list description")
-    );
+    assert_eq!(namespaced.description, "Custom server list description");
 
     let _ = client.cancel().await;
     Ok(())
+}
+
+async fn gambi_help(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    server: Option<&str>,
+    tool: Option<&str>,
+) -> anyhow::Result<HelpResponse> {
+    let arguments = {
+        let mut args = serde_json::Map::new();
+        if let Some(server_name) = server {
+            args.insert("server".to_string(), json!(server_name));
+        }
+        if let Some(tool_name) = tool {
+            args.insert("tool".to_string(), json!(tool_name));
+        }
+        if args.is_empty() { None } else { Some(args) }
+    };
+
+    let result = client
+        .call_tool(CallToolRequestParams {
+            meta: None,
+            name: "gambi_help".to_string().into(),
+            arguments,
+            task: None,
+        })
+        .await?;
+
+    if result.is_error.unwrap_or(false) {
+        let first_text = result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_else(|| "gambi_help returned an error".to_string());
+        anyhow::bail!(first_text);
+    }
+
+    if let Some(structured) = result.structured_content {
+        return Ok(serde_json::from_value(structured)?);
+    }
+
+    let first_text = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .map(|text| text.text.clone())
+        .ok_or_else(|| anyhow::anyhow!("gambi_help did not return parseable output"))?;
+
+    Ok(serde_json::from_str(&first_text)?)
 }
 
 fn write_config(path: &Path, contents: &str) -> anyhow::Result<()> {

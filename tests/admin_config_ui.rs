@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use rmcp::{
     ServiceExt,
+    model::CallToolRequestParams,
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
 use serde::Deserialize;
@@ -23,8 +24,7 @@ struct ServerEntry {
 async fn admin_can_add_remove_servers_and_set_tool_description_overrides() -> anyhow::Result<()> {
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
-    let xdg_config_home = temp.path();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     write_config(
@@ -60,7 +60,7 @@ async fn admin_can_add_remove_servers_and_set_tool_description_overrides() -> an
         cmd.arg("--admin-port-file");
         cmd.arg(&admin_port_file);
         cmd.arg("--no-exec");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ().serve(transport).await?;
@@ -102,15 +102,30 @@ async fn admin_can_add_remove_servers_and_set_tool_description_overrides() -> an
         .await?
         .error_for_status()?;
 
-    // wait for discovery to observe latest config update
+    // wait for gambi_help to observe latest config update
     let mut saw_override = false;
     for _ in 0..20 {
-        let tools = client.list_all_tools().await?;
-        if let Some(tool) = tools
-            .iter()
-            .find(|tool| tool.name.as_ref() == "fixture:fixture_echo")
-            && tool.description.as_deref() == Some("Custom fixture echo description")
-        {
+        let help = client
+            .call_tool(CallToolRequestParams {
+                meta: None,
+                name: "gambi_help".to_string().into(),
+                arguments: Some(
+                    serde_json::json!({
+                        "server": "fixture",
+                        "tool": "fixture_echo"
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                ),
+                task: None,
+            })
+            .await?;
+        let Some(payload) = help.structured_content else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        if payload["tool"]["description"] == "Custom fixture echo description" {
             saw_override = true;
             break;
         }

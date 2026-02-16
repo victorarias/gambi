@@ -16,30 +16,25 @@ use tokio::process::Command;
 async fn gambi_cancels_routed_tool_calls() -> anyhow::Result<()> {
     let (client, _temp) = spawn_gambi_with_fixture().await?;
 
-    let request = ClientRequest::CallToolRequest(Request::new(CallToolRequestParams {
-        meta: None,
-        name: "fixture:fixture_cancel".to_string().into(),
-        arguments: None,
-        task: None,
-    }));
-
-    let handle = client
-        .send_cancellable_request(request, PeerRequestOptions::no_options())
-        .await?;
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    client
-        .notify_cancelled(CancelledNotificationParam {
-            request_id: handle.id.clone(),
-            reason: Some("test cancellation".to_string()),
+    let err = client
+        .call_tool(CallToolRequestParams {
+            meta: None,
+            name: "fixture:fixture_cancel".to_string().into(),
+            arguments: None,
+            task: None,
         })
-        .await?;
-
-    let err = handle
-        .await_response()
         .await
-        .expect_err("tool call must cancel");
-    assert_cancelled_error(err);
+        .expect_err("direct namespaced upstream tool call must be rejected");
+    match err {
+        ServiceError::McpError(data) => {
+            assert_eq!(data.code, ErrorCode::INVALID_PARAMS);
+            assert!(
+                data.message
+                    .contains("direct upstream tool invocation is disabled")
+            );
+        }
+        other => panic!("expected MCP invalid params error, got: {other}"),
+    }
 
     let _ = client.cancel().await;
     Ok(())
@@ -133,8 +128,7 @@ async fn spawn_gambi_with_fixture() -> anyhow::Result<(
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path().to_path_buf();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     let fixture_url = format!("stdio:///{bin}?arg=__fixture_progress_server", bin = bin);
@@ -153,7 +147,7 @@ async fn spawn_gambi_with_fixture() -> anyhow::Result<(
         cmd.arg("--admin-port");
         cmd.arg("0");
         cmd.arg("--no-exec");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ().serve(transport).await?;

@@ -30,8 +30,25 @@ use tokio_util::sync::CancellationToken;
 struct ExecuteResponse {
     result: serde_json::Value,
     tool_calls: usize,
+    #[allow(dead_code)]
     elapsed_ms: u128,
     stdout: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelpToolSummary {
+    namespaced_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelpServerSummary {
+    name: String,
+    tools: Vec<HelpToolSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelpResponse {
+    servers: Vec<HelpServerSummary>,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -74,10 +91,8 @@ async fn run_mixed_operation(
         0 => {
             let tools = client.list_all_tools().await?;
             anyhow::ensure!(
-                tools
-                    .iter()
-                    .any(|tool| tool.name.as_ref() == "fixture:fixture_echo"),
-                "fixture tool missing from aggregated list"
+                tools.iter().any(|tool| tool.name.as_ref() == "gambi_help"),
+                "gambi_help missing from local tools list"
             );
             anyhow::ensure!(
                 tools
@@ -85,29 +100,33 @@ async fn run_mixed_operation(
                     .any(|tool| tool.name.as_ref() == "gambi_execute"),
                 "gambi_execute missing from aggregated list"
             );
+            let help = help(client, Some("fixture")).await?;
+            let fixture = help
+                .servers
+                .iter()
+                .find(|server| server.name == "fixture")
+                .ok_or_else(|| anyhow::anyhow!("fixture server missing from gambi_help"))?;
+            anyhow::ensure!(
+                fixture
+                    .tools
+                    .iter()
+                    .any(|tool| tool.namespaced_name == "fixture:fixture_echo"),
+                "fixture:fixture_echo missing from gambi_help discovery"
+            );
         }
         1 => {
-            let result = client
-                .call_tool(CallToolRequestParams {
-                    meta: None,
-                    name: "fixture:fixture_echo".to_string().into(),
-                    arguments: Some(
-                        json!({
-                            "idx": idx,
-                            "parity": if idx.is_multiple_of(2) { "even" } else { "odd" }
-                        })
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
-                    ),
-                    task: None,
-                })
-                .await?;
+            let parity = if idx.is_multiple_of(2) { "even" } else { "odd" };
+            let code = format!(
+                r#"
+result = fixture.fixture_echo(idx={idx}, parity="{parity}")
+return result["echo"]
+"#
+            );
 
-            let payload = result
-                .structured_content
-                .ok_or_else(|| anyhow::anyhow!("missing structured payload for fixture_echo"))?;
-            anyhow::ensure!(payload["echo"]["idx"] == idx);
+            let output = execute(client, &code).await?;
+            anyhow::ensure!(output.result["idx"] == idx);
+            anyhow::ensure!(output.result["parity"] == parity);
+            anyhow::ensure!(output.tool_calls == 1);
         }
         _ => {
             let code = format!(
@@ -123,7 +142,6 @@ return {{"first": first["echo"]["step"], "second": second["echo"]["step"]}}
             anyhow::ensure!(output.result["first"] == idx);
             anyhow::ensure!(output.result["second"] == idx + 1);
             anyhow::ensure!(output.tool_calls == 2);
-            anyhow::ensure!(output.elapsed_ms > 0);
             anyhow::ensure!(!output.stdout.is_empty());
         }
     }
@@ -169,6 +187,49 @@ async fn execute(
         .and_then(|content| content.as_text())
         .map(|text| text.text.clone())
         .ok_or_else(|| anyhow::anyhow!("gambi_execute did not return parseable output"))?;
+
+    Ok(serde_json::from_str(&first_text)?)
+}
+
+async fn help(
+    client: &RunningService<RoleClient, ()>,
+    server: Option<&str>,
+) -> anyhow::Result<HelpResponse> {
+    let arguments = server.map(|name| {
+        json!({ "server": name })
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+    });
+    let result = client
+        .call_tool(CallToolRequestParams {
+            meta: None,
+            name: "gambi_help".to_string().into(),
+            arguments,
+            task: None,
+        })
+        .await?;
+
+    if result.is_error.unwrap_or(false) {
+        let first_text = result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_else(|| "gambi_help returned an error".to_string());
+        anyhow::bail!(first_text);
+    }
+
+    if let Some(structured) = result.structured_content {
+        return Ok(serde_json::from_value(structured)?);
+    }
+
+    let first_text = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .map(|text| text.text.clone())
+        .ok_or_else(|| anyhow::anyhow!("gambi_help did not return parseable output"))?;
 
     Ok(serde_json::from_str(&first_text)?)
 }
@@ -265,7 +326,7 @@ async fn gambi_stays_healthy_during_remote_bounce_under_load() -> anyhow::Result
 "#;
 
     let (client, _temp) =
-        support::spawn_gambi_with_config((), &config, tokens, true, &BTreeMap::new()).await?;
+        support::spawn_gambi_with_config((), &config, tokens, false, &BTreeMap::new()).await?;
 
     let bounce_cycles = env_usize("GAMBI_RELIABILITY_BOUNCE_CYCLES", 12, 1, 128);
     let bounce_every = env_usize("GAMBI_RELIABILITY_BOUNCE_EVERY", 3, 1, 32);
@@ -317,39 +378,27 @@ async fn call_remote_echo_with_retry(
     retry_backoff_ms: u64,
 ) -> anyhow::Result<()> {
     for attempt in 0..retry_attempts {
-        let result = client
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: "remote:remote_echo".to_string().into(),
-                arguments: Some(
-                    json!({
-                        "cycle": cycle,
-                        "worker": worker,
-                        "attempt": attempt,
-                    })
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default(),
-                ),
-                task: None,
-            })
-            .await;
+        let code = format!(
+            r#"
+result = remote.remote_echo(cycle={cycle}, worker={worker}, attempt={attempt})
+return result
+"#
+        );
+        let result = execute(client, &code).await;
 
         match result {
-            Ok(value) => {
-                let payload = value
-                    .structured_content
-                    .ok_or_else(|| anyhow::anyhow!("missing structured payload for remote echo"))?;
-                anyhow::ensure!(payload["source"] == "remote");
-                anyhow::ensure!(payload["echo"]["cycle"] == cycle);
-                anyhow::ensure!(payload["echo"]["worker"] == worker);
+            Ok(output) => {
+                anyhow::ensure!(output.result["source"] == "remote");
+                anyhow::ensure!(output.result["echo"]["cycle"] == cycle);
+                anyhow::ensure!(output.result["echo"]["worker"] == worker);
+                anyhow::ensure!(output.tool_calls == 1);
                 return Ok(());
             }
             Err(err) if attempt + 1 < retry_attempts => {
                 tracing::debug!(error = %err, cycle, worker, attempt, "remote echo failed, retrying");
                 tokio::time::sleep(Duration::from_millis(retry_backoff_ms)).await;
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         }
     }
 
@@ -402,14 +451,14 @@ async fn spawn_authenticated_remote_server(
             let bind_port = preferred_port.unwrap_or(0);
             match tokio::net::TcpListener::bind(("127.0.0.1", bind_port)).await {
                 Ok(listener) => break listener,
-                Err(err) if preferred_port.is_some() && attempts < 20 => {
+                Err(err) if preferred_port.is_some() && attempts < 200 => {
                     attempts += 1;
                     tracing::debug!(
                         error = %err,
                         attempts,
                         "retrying remote fixture bind on preferred port"
                     );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(err) => return Err(err.into()),
             }

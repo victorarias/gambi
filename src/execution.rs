@@ -217,7 +217,7 @@ async fn run_monty_execution_loop(
 #[derive(Debug)]
 struct ExternalToolCall {
     name: String,
-    arguments: Option<Map<String, Value>>,
+    arguments: Map<String, Value>,
 }
 
 fn parse_external_tool_call(
@@ -262,19 +262,12 @@ fn parse_external_tool_call(
         arguments.insert(key, value);
     }
 
-    Ok(ExternalToolCall {
-        name,
-        arguments: if arguments.is_empty() {
-            None
-        } else {
-            Some(arguments)
-        },
-    })
+    Ok(ExternalToolCall { name, arguments })
 }
 
 async fn handle_tool_call(
     namespaced_name: String,
-    arguments: Option<Map<String, Value>>,
+    arguments: Map<String, Value>,
     servers_by_name: &HashMap<String, ServerConfig>,
     auth_headers: &UpstreamAuthHeaders,
     upstream: &UpstreamManager,
@@ -295,7 +288,7 @@ async fn handle_tool_call(
     let request = CallToolRequestParams {
         meta: Some(context.meta.clone()),
         name: upstream_tool_name.to_string().into(),
-        arguments,
+        arguments: Some(arguments),
         task: None,
     };
 
@@ -788,7 +781,9 @@ impl monty::PrintWriter for BoundedPrint {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_monty_script, rewrite_namespaced_tool_calls};
+    use monty::MontyObject;
+
+    use super::{build_monty_script, parse_external_tool_call, rewrite_namespaced_tool_calls};
     use crate::config::ServerConfig;
 
     #[test]
@@ -799,6 +794,8 @@ mod tests {
                 name: "port".to_string(),
                 url: "https://example.com/mcp".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             }],
         )
         .expect("rewrite should succeed");
@@ -814,6 +811,8 @@ mod tests {
                 name: "fixture".to_string(),
                 url: "stdio://fixture".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             }],
         )
         .expect("script build should succeed");
@@ -821,6 +820,17 @@ mod tests {
         assert!(script.contains("def __gambi_user_main__():"));
         assert!(script.contains("__gambi_user_main__()"));
         assert!(script.contains("__gambi_call__(\"fixture:fixture_echo\", value=1)"));
+    }
+
+    #[test]
+    fn parse_external_tool_call_keeps_empty_object_arguments() {
+        let parsed = parse_external_tool_call(
+            vec![MontyObject::String("fixture:fixture_echo".to_string())],
+            vec![],
+        )
+        .expect("parse should succeed");
+
+        assert!(parsed.arguments.is_empty());
     }
 
     #[test]
@@ -835,6 +845,8 @@ result = fixture.fixture_echo(value=3)
                 name: "fixture".to_string(),
                 url: "stdio://fixture".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             }],
         )
         .expect("rewrite should succeed");
@@ -866,6 +878,8 @@ return fixture.fixture_echo(value=2)
                 name: "fixture".to_string(),
                 url: "stdio://fixture".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             }],
         )
         .expect("rewrite should succeed");
@@ -888,6 +902,8 @@ return fixture.fixture_echo(value=2)
                 name: "fixture".to_string(),
                 url: "stdio://fixture".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             }],
         )
         .expect("rewrite should succeed");
@@ -907,6 +923,8 @@ return fixture.fixture_echo(value=3)
                 name: "fixture".to_string(),
                 url: "stdio://fixture".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             }],
         )
         .expect("rewrite should succeed");
@@ -924,6 +942,8 @@ return fixture.fixture_echo(value=3)
                 name: "fixture".to_string(),
                 url: "stdio://fixture".to_string(),
                 oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
             }],
         )
         .expect("rewrite should succeed");

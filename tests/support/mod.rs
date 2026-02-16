@@ -27,8 +27,7 @@ where
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path().to_path_buf();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     write_config(&gambi_config_dir.join("config.json"), config_json)?;
@@ -41,7 +40,7 @@ where
         if no_exec {
             cmd.arg("--no-exec");
         }
-        cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
         for (key, value) in extra_env {
             cmd.env(key, value);
         }

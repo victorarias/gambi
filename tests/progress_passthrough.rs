@@ -31,12 +31,22 @@ impl ClientHandler for ProgressClient {
 
 #[tokio::test]
 async fn gambi_forwards_tool_progress_notifications_for_routed_calls() -> anyhow::Result<()> {
-    let (client, _temp) = spawn_gambi_with_fixture().await?;
+    let (client, _temp) = spawn_gambi_with_fixture_for_exec().await?;
 
     let request = ClientRequest::CallToolRequest(Request::new(CallToolRequestParams {
         meta: None,
-        name: "fixture:fixture_progress".to_string().into(),
-        arguments: None,
+        name: "gambi_execute".to_string().into(),
+        arguments: Some(
+            serde_json::json!({
+                "code": r#"
+result = fixture.fixture_progress()
+return {"status": result["status"]}
+"#
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        ),
         task: None,
     }));
 
@@ -121,48 +131,6 @@ async fn gambi_forwards_resource_progress_notifications_for_routed_calls() -> an
     Ok(())
 }
 
-#[tokio::test]
-async fn gambi_forwards_tool_progress_notifications_for_execute_nested_calls() -> anyhow::Result<()>
-{
-    let (client, _temp) = spawn_gambi_with_fixture_for_exec().await?;
-
-    let request = ClientRequest::CallToolRequest(Request::new(CallToolRequestParams {
-        meta: None,
-        name: "gambi_execute".to_string().into(),
-        arguments: Some(
-            serde_json::json!({
-                "code": r#"
-result = fixture.fixture_progress()
-return {"status": result["status"]}
-"#
-            })
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
-        ),
-        task: None,
-    }));
-
-    let handle = client
-        .send_cancellable_request(request, PeerRequestOptions::no_options())
-        .await?;
-
-    let observed = collect_progress(&client, handle.progress_token.clone(), 5).await?;
-    let response = handle.await_response().await?;
-
-    match response {
-        ServerResult::CallToolResult(result) => {
-            assert!(!result.is_error.unwrap_or(false));
-        }
-        other => anyhow::bail!("unexpected response variant: {other:?}"),
-    }
-
-    assert_progress_sequence(&observed);
-
-    let _ = client.cancel().await;
-    Ok(())
-}
-
 async fn spawn_gambi_with_fixture() -> anyhow::Result<(
     rmcp::service::RunningService<rmcp::RoleClient, ProgressClient>,
     tempfile::TempDir,
@@ -170,8 +138,7 @@ async fn spawn_gambi_with_fixture() -> anyhow::Result<(
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path().to_path_buf();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     let fixture_url = format!("stdio:///{bin}?arg=__fixture_progress_server", bin = bin);
@@ -190,7 +157,7 @@ async fn spawn_gambi_with_fixture() -> anyhow::Result<(
         cmd.arg("--admin-port");
         cmd.arg("0");
         cmd.arg("--no-exec");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ProgressClient::default().serve(transport).await?;
@@ -204,8 +171,7 @@ async fn spawn_gambi_with_fixture_for_exec() -> anyhow::Result<(
     let bin = env!("CARGO_BIN_EXE_gambi");
     let temp = tempfile::tempdir()?;
 
-    let xdg_config_home = temp.path().to_path_buf();
-    let gambi_config_dir = xdg_config_home.join("gambi");
+    let gambi_config_dir = temp.path().join("gambi");
     std::fs::create_dir_all(&gambi_config_dir)?;
 
     let fixture_url = format!("stdio:///{bin}?arg=__fixture_progress_server", bin = bin);
@@ -223,7 +189,7 @@ async fn spawn_gambi_with_fixture_for_exec() -> anyhow::Result<(
         cmd.arg("serve");
         cmd.arg("--admin-port");
         cmd.arg("0");
-        cmd.env("XDG_CONFIG_HOME", xdg_config_home);
+        cmd.env("GAMBI_CONFIG_DIR", &gambi_config_dir);
     }))?;
 
     let client = ProgressClient::default().serve(transport).await?;

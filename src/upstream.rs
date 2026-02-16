@@ -30,8 +30,9 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::auth::TokenState;
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, TransportMode};
 use crate::namespacing::{namespaced, namespaced_resource_template_uri, namespaced_resource_uri};
+use crate::sse_transport::LegacySseWorker;
 
 const DEFAULT_UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_UPSTREAM_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -82,10 +83,16 @@ pub struct HttpServerTarget {
     pub uri: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseServerTarget {
+    pub uri: String,
+}
+
 #[derive(Debug, Clone)]
 enum UpstreamTransportTarget {
     Stdio(StdioServerTarget),
     Http(HttpServerTarget),
+    Sse(SseServerTarget),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -340,6 +347,7 @@ impl ManagedUpstreamClient {
 #[derive(Default)]
 struct UpstreamManagerInner {
     clients: Mutex<HashMap<String, Arc<ManagedUpstreamClient>>>,
+    client_creation_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     discovery_caches: Mutex<DiscoveryCaches>,
 }
 
@@ -831,6 +839,9 @@ impl UpstreamManager {
         server: &ServerConfig,
         auth_header: Option<&str>,
     ) -> Result<Arc<ManagedUpstreamClient>> {
+        let creation_lock = self.client_creation_lock(&server.name).await;
+        let _creation_guard = creation_lock.lock().await;
+
         if let Some(existing) = {
             let guard = self.inner.clients.lock().await;
             guard.get(&server.name).cloned()
@@ -852,6 +863,14 @@ impl UpstreamManager {
         }
     }
 
+    async fn client_creation_lock(&self, server_name: &str) -> Arc<Mutex<()>> {
+        let mut guard = self.inner.client_creation_locks.lock().await;
+        guard
+            .entry(server_name.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     async fn evict_client(&self, server_name: &str) {
         let client = {
             let mut guard = self.inner.clients.lock().await;
@@ -869,20 +888,34 @@ impl UpstreamManager {
         server: &ServerConfig,
         auth_header: Option<&str>,
     ) -> Result<Vec<DiscoveredTool>> {
-        let client = self.managed_client(server, auth_header).await?;
-        let discovered = timeout(self.discovery_timeout, client.peer.list_all_tools())
+        let discovered = match self
+            .discover_tools_for_server_once(server, auth_header)
             .await
-            .with_context(|| format!("tool discovery timed out for '{}'", server.name))
-            .and_then(|response| {
-                response
-                    .with_context(|| format!("tool discovery request failed for '{}'", server.name))
-            });
-
-        let discovered = match discovered {
+        {
             Ok(discovered) => discovered,
-            Err(err) => {
+            Err(first_err) => {
+                warn!(
+                    server = %server.name,
+                    error = %first_err,
+                    "tool discovery failed on first attempt; evicting client and retrying once"
+                );
                 self.evict_client(&server.name).await;
-                return Err(err);
+                match self
+                    .discover_tools_for_server_once(server, auth_header)
+                    .await
+                {
+                    Ok(discovered) => {
+                        debug!(
+                            server = %server.name,
+                            "tool discovery recovered after client reconnect retry"
+                        );
+                        discovered
+                    }
+                    Err(retry_err) => {
+                        self.evict_client(&server.name).await;
+                        return Err(retry_err);
+                    }
+                }
             }
         };
 
@@ -908,21 +941,34 @@ impl UpstreamManager {
         server: &ServerConfig,
         auth_header: Option<&str>,
     ) -> Result<Vec<DiscoveredPrompt>> {
-        let client = self.managed_client(server, auth_header).await?;
-        let discovered = timeout(self.discovery_timeout, client.peer.list_all_prompts())
+        let discovered = match self
+            .discover_prompts_for_server_once(server, auth_header)
             .await
-            .with_context(|| format!("prompt discovery timed out for '{}'", server.name))
-            .and_then(|response| {
-                response.with_context(|| {
-                    format!("prompt discovery request failed for '{}'", server.name)
-                })
-            });
-
-        let discovered = match discovered {
+        {
             Ok(discovered) => discovered,
-            Err(err) => {
+            Err(first_err) => {
+                warn!(
+                    server = %server.name,
+                    error = %first_err,
+                    "prompt discovery failed on first attempt; evicting client and retrying once"
+                );
                 self.evict_client(&server.name).await;
-                return Err(err);
+                match self
+                    .discover_prompts_for_server_once(server, auth_header)
+                    .await
+                {
+                    Ok(discovered) => {
+                        debug!(
+                            server = %server.name,
+                            "prompt discovery recovered after client reconnect retry"
+                        );
+                        discovered
+                    }
+                    Err(retry_err) => {
+                        self.evict_client(&server.name).await;
+                        return Err(retry_err);
+                    }
+                }
             }
         };
 
@@ -945,51 +991,34 @@ impl UpstreamManager {
         server: &ServerConfig,
         auth_header: Option<&str>,
     ) -> Result<(Vec<DiscoveredResource>, Vec<DiscoveredResourceTemplate>)> {
-        let client = self.managed_client(server, auth_header).await?;
-
-        let discovered_resources =
-            timeout(self.discovery_timeout, client.peer.list_all_resources())
-                .await
-                .with_context(|| format!("resource discovery timed out for '{}'", server.name))
-                .and_then(|response| {
-                    response.with_context(|| {
-                        format!("resource discovery request failed for '{}'", server.name)
-                    })
-                });
-
-        let discovered_resources = match discovered_resources {
-            Ok(resources) => resources,
-            Err(err) => {
+        let (discovered_resources, discovered_templates) = match self
+            .discover_resources_for_server_once(server, auth_header)
+            .await
+        {
+            Ok(discovered) => discovered,
+            Err(first_err) => {
+                warn!(
+                    server = %server.name,
+                    error = %first_err,
+                    "resource discovery failed on first attempt; evicting client and retrying once"
+                );
                 self.evict_client(&server.name).await;
-                return Err(err);
-            }
-        };
-
-        let discovered_templates = timeout(
-            self.discovery_timeout,
-            client.peer.list_all_resource_templates(),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "resource template discovery timed out for '{}'",
-                server.name
-            )
-        })
-        .and_then(|response| {
-            response.with_context(|| {
-                format!(
-                    "resource template discovery request failed for '{}'",
-                    server.name
-                )
-            })
-        });
-
-        let discovered_templates = match discovered_templates {
-            Ok(templates) => templates,
-            Err(err) => {
-                self.evict_client(&server.name).await;
-                return Err(err);
+                match self
+                    .discover_resources_for_server_once(server, auth_header)
+                    .await
+                {
+                    Ok(discovered) => {
+                        debug!(
+                            server = %server.name,
+                            "resource discovery recovered after client reconnect retry"
+                        );
+                        discovered
+                    }
+                    Err(retry_err) => {
+                        self.evict_client(&server.name).await;
+                        return Err(retry_err);
+                    }
+                }
             }
         };
 
@@ -1027,6 +1056,77 @@ impl UpstreamManager {
         }
 
         Ok((resources, templates))
+    }
+
+    async fn discover_tools_for_server_once(
+        &self,
+        server: &ServerConfig,
+        auth_header: Option<&str>,
+    ) -> Result<Vec<Tool>> {
+        let client = self.managed_client(server, auth_header).await?;
+        timeout(self.discovery_timeout, client.peer.list_all_tools())
+            .await
+            .with_context(|| format!("tool discovery timed out for '{}'", server.name))
+            .and_then(|response| {
+                response
+                    .with_context(|| format!("tool discovery request failed for '{}'", server.name))
+            })
+    }
+
+    async fn discover_prompts_for_server_once(
+        &self,
+        server: &ServerConfig,
+        auth_header: Option<&str>,
+    ) -> Result<Vec<Prompt>> {
+        let client = self.managed_client(server, auth_header).await?;
+        timeout(self.discovery_timeout, client.peer.list_all_prompts())
+            .await
+            .with_context(|| format!("prompt discovery timed out for '{}'", server.name))
+            .and_then(|response| {
+                response.with_context(|| {
+                    format!("prompt discovery request failed for '{}'", server.name)
+                })
+            })
+    }
+
+    async fn discover_resources_for_server_once(
+        &self,
+        server: &ServerConfig,
+        auth_header: Option<&str>,
+    ) -> Result<(Vec<Resource>, Vec<ResourceTemplate>)> {
+        let client = self.managed_client(server, auth_header).await?;
+
+        let discovered_resources =
+            timeout(self.discovery_timeout, client.peer.list_all_resources())
+                .await
+                .with_context(|| format!("resource discovery timed out for '{}'", server.name))
+                .and_then(|response| {
+                    response.with_context(|| {
+                        format!("resource discovery request failed for '{}'", server.name)
+                    })
+                })?;
+
+        let discovered_templates = timeout(
+            self.discovery_timeout,
+            client.peer.list_all_resource_templates(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "resource template discovery timed out for '{}'",
+                server.name
+            )
+        })
+        .and_then(|response| {
+            response.with_context(|| {
+                format!(
+                    "resource template discovery request failed for '{}'",
+                    server.name
+                )
+            })
+        })?;
+
+        Ok((discovered_resources, discovered_templates))
     }
 
     async fn cached_tools(&self, key: u64) -> Option<DiscoveryResult> {
@@ -1088,6 +1188,37 @@ async fn spawn_managed_client(
         UpstreamTransportTarget::Stdio(target) => spawn_managed_stdio_client(server, &target).await,
         UpstreamTransportTarget::Http(target) => {
             spawn_managed_http_client(server, &target, auth_header).await
+        }
+        UpstreamTransportTarget::Sse(target) => {
+            match spawn_managed_sse_client(server, &target, auth_header).await {
+                Ok(client) => Ok(client),
+                Err(sse_err) if server.transport == TransportMode::Auto => {
+                    warn!(
+                        server = %server.name,
+                        uri = %target.uri,
+                        error = %sse_err,
+                        "legacy-sse transport initialization failed in auto mode; retrying with streamable-http"
+                    );
+                    let http_target = HttpServerTarget {
+                        uri: target.uri.clone(),
+                    };
+                    match spawn_managed_http_client(server, &http_target, auth_header).await {
+                        Ok(client) => {
+                            warn!(
+                                server = %server.name,
+                                uri = %target.uri,
+                                "auto transport fallback to streamable-http succeeded"
+                            );
+                            Ok(client)
+                        }
+                        Err(http_err) => Err(anyhow!(
+                            "auto transport failed for '{}': legacy-sse error: {sse_err:#}; streamable-http fallback error: {http_err:#}",
+                            server.name
+                        )),
+                    }
+                }
+                Err(sse_err) => Err(sse_err),
+            }
         }
     }
 }
@@ -1170,6 +1301,48 @@ async fn spawn_managed_http_client(
     })
 }
 
+async fn spawn_managed_sse_client(
+    server: &ServerConfig,
+    target: &SseServerTarget,
+    auth_header: Option<&str>,
+) -> Result<ManagedUpstreamClient> {
+    debug!(
+        server = %server.name,
+        uri = %target.uri,
+        has_auth = auth_header.is_some(),
+        "spawning managed legacy-sse upstream client"
+    );
+
+    // No client-level timeout: the SSE GET connection is long-lived.
+    // POST requests use per-request timeouts in the worker.
+    let http_client = reqwest::Client::builder()
+        .build()
+        .context("failed to construct reqwest client for legacy-sse transport")?;
+
+    let worker = LegacySseWorker::new(
+        http_client,
+        target.uri.clone(),
+        auth_header.map(std::string::ToString::to_string),
+    );
+
+    let handler = UpstreamClient::default();
+    let service =
+        handler.clone().serve(worker).await.with_context(|| {
+            format!("failed to initialize MCP SSE client for '{}'", server.name)
+        })?;
+
+    let peer = service.peer().clone();
+
+    Ok(ManagedUpstreamClient {
+        server_name: server.name.clone(),
+        server_url: server.url.clone(),
+        auth_header: auth_header.map(std::string::ToString::to_string),
+        peer,
+        progress_registry: handler.progress_registry(),
+        running: Mutex::new(Some(service)),
+    })
+}
+
 fn parse_upstream_target(server: &ServerConfig) -> Result<UpstreamTransportTarget> {
     if server.url.starts_with("stdio://") {
         let target = parse_stdio_server(server)
@@ -1193,9 +1366,22 @@ fn parse_upstream_target(server: &ServerConfig) -> Result<UpstreamTransportTarge
                     server.name
                 );
             }
-            Ok(UpstreamTransportTarget::Http(HttpServerTarget {
-                uri: server.url.clone(),
-            }))
+
+            let use_sse = match server.transport {
+                TransportMode::Sse => true,
+                TransportMode::StreamableHttp => false,
+                TransportMode::Auto => parsed.path().ends_with("/sse"),
+            };
+
+            if use_sse {
+                Ok(UpstreamTransportTarget::Sse(SseServerTarget {
+                    uri: server.url.clone(),
+                }))
+            } else {
+                Ok(UpstreamTransportTarget::Http(HttpServerTarget {
+                    uri: server.url.clone(),
+                }))
+            }
         }
         other => bail!(
             "unsupported transport scheme '{}' for server '{}'; expected stdio/http/https",
@@ -1330,6 +1516,8 @@ mod tests {
             name: "remote".to_string(),
             url: "https://example.com/mcp".to_string(),
             oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
         };
 
         let parsed = parse_upstream_target(&server).expect("parse should succeed");
@@ -1337,7 +1525,9 @@ mod tests {
             UpstreamTransportTarget::Http(target) => {
                 assert_eq!(target.uri, "https://example.com/mcp");
             }
-            UpstreamTransportTarget::Stdio(_) => panic!("expected http target"),
+            UpstreamTransportTarget::Stdio(_) | UpstreamTransportTarget::Sse(_) => {
+                panic!("expected http target")
+            }
         }
     }
 

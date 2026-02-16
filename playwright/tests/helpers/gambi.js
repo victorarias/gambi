@@ -114,7 +114,7 @@ async function startGambi({ binPath, configHome, execEnabled = false }) {
   const child = spawn(binPath, args, {
     env: {
       ...process.env,
-      XDG_CONFIG_HOME: configHome,
+      GAMBI_CONFIG_DIR: path.join(configHome, "gambi"),
       RUST_LOG: process.env.RUST_LOG || "error",
     },
     stdio: ["pipe", "pipe", "pipe"],

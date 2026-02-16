@@ -1,12 +1,14 @@
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use serde::Deserialize;
 
 use crate::auth::{TokenState, prune_token_state_for_server_names};
-use crate::config::{AppConfig, ConfigStore, ServerConfig};
+use crate::config::{AppConfig, ConfigStore, ExposureMode, ServerConfig, TransportMode};
 use crate::server;
 
 #[derive(Debug, Parser)]
@@ -19,7 +21,9 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Serve(ServeArgs),
+    Stop(StopArgs),
     Add(AddArgs),
+    Exposure(ExposureArgs),
     List,
     Remove(RemoveArgs),
     Export(ExportArgs),
@@ -42,12 +46,49 @@ pub struct ServeArgs {
     /// Disable the `gambi_execute` MCP tool.
     #[arg(long, default_value_t = false)]
     pub no_exec: bool,
+    /// Run only the admin/auth services without MCP stdio.
+    #[arg(long, hide = true, default_value_t = false)]
+    pub admin_only: bool,
 }
 
 #[derive(Debug, Args)]
 struct AddArgs {
     name: String,
     url: String,
+    /// Transport mode: auto (detect from URL), sse, or streamable-http.
+    #[arg(long, default_value = "auto")]
+    transport: String,
+    /// Exposure mode for gambi_help: passthrough|compact|names-only|server-only.
+    #[arg(long, default_value = "passthrough")]
+    exposure: String,
+}
+
+#[derive(Debug, Args)]
+struct ExposureArgs {
+    /// Configured server name.
+    name: String,
+    /// Exposure mode: passthrough|compact|names-only|server-only.
+    exposure: String,
+}
+
+#[derive(Debug, Args)]
+struct StopArgs {
+    /// Loopback address for the shared admin daemon.
+    #[arg(long, default_value = "127.0.0.1")]
+    admin_host: IpAddr,
+    /// Admin daemon port.
+    #[arg(long, default_value_t = 3333)]
+    admin_port: u16,
+    /// Force kill if graceful shutdown does not stop the daemon.
+    #[arg(long, default_value_t = false)]
+    force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonStateRecord {
+    pid: u32,
+    host: String,
+    port: u16,
 }
 
 #[cfg(test)]
@@ -75,6 +116,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_stop_defaults() {
+        let cli = Cli::parse_from(["gambi", "stop"]);
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("admin_host: 127.0.0.1"));
+        assert!(debug.contains("admin_port: 3333"));
+        assert!(debug.contains("force: false"));
+    }
+
+    #[test]
     fn parses_export_and_import_commands() {
         let export = Cli::parse_from(["gambi", "export", "--out", "/tmp/config.json"]);
         let export_debug = format!("{export:?}");
@@ -85,6 +135,20 @@ mod tests {
         let import_debug = format!("{import:?}");
         assert!(import_debug.contains("Import"));
         assert!(import_debug.contains("/tmp/config.json"));
+    }
+
+    #[test]
+    fn parses_add_with_exposure_mode() {
+        let cli = Cli::parse_from([
+            "gambi",
+            "add",
+            "atlassian",
+            "https://mcp.atlassian.com/v1/sse",
+            "--exposure",
+            "names-only",
+        ]);
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("exposure: \"names-only\""));
     }
 
     #[tokio::test]
@@ -109,6 +173,8 @@ mod tests {
                     name: "port".to_string(),
                     url: "https://example.com/mcp".to_string(),
                     oauth: None,
+                    transport: Default::default(),
+                    exposure_mode: Default::default(),
                 }],
                 tool_description_overrides: std::collections::BTreeMap::new(),
             })
@@ -135,6 +201,15 @@ mod tests {
                         next_retry_after_epoch_seconds: None,
                     },
                 );
+                tokens.registered_clients.insert(
+                    "port".to_string(),
+                    crate::auth::RegisteredClient {
+                        client_id: "dynamic-client".to_string(),
+                        client_secret: None,
+                        registration_client_uri: None,
+                        registration_access_token: None,
+                    },
+                );
                 Ok(())
             })
             .expect("token state should persist");
@@ -147,6 +222,7 @@ mod tests {
         let tokens: TokenState = store.load_tokens().expect("token state should load");
         assert!(tokens.oauth_tokens.is_empty());
         assert!(tokens.oauth_health.is_empty());
+        assert!(tokens.registered_clients.is_empty());
     }
 }
 
@@ -176,15 +252,27 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
             }
             server::serve(args, store).await
         }
+        Commands::Stop(args) => stop_daemon(args, store).await,
         Commands::Add(args) => {
+            let transport = parse_transport_flag(&args.transport)?;
+            let exposure_mode = parse_exposure_flag(&args.exposure)?;
             store.update(|cfg| {
                 cfg.add_server(ServerConfig {
                     name: args.name,
                     url: args.url,
                     oauth: None,
+                    transport,
+                    exposure_mode,
                 })
             })?;
             println!("server added");
+            Ok(())
+        }
+        Commands::Exposure(args) => {
+            let exposure_mode = parse_exposure_flag(&args.exposure)?;
+            let server_name = args.name.clone();
+            store.update(move |cfg| cfg.set_server_exposure_mode(&server_name, exposure_mode))?;
+            println!("server exposure updated");
             Ok(())
         }
         Commands::List => {
@@ -195,7 +283,12 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
             }
 
             for server in cfg.servers {
-                println!("{}\t{}", server.name, server.url);
+                println!(
+                    "{}\t{}\t{}",
+                    server.name,
+                    server.url,
+                    server.exposure_mode.as_str()
+                );
             }
             Ok(())
         }
@@ -252,5 +345,148 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
             Ok(())
         }
         Commands::FixtureProgressServer => crate::fixture_progress::run().await,
+    }
+}
+
+async fn stop_daemon(args: StopArgs, store: ConfigStore) -> Result<()> {
+    if !args.admin_host.is_loopback() {
+        bail!("admin host must be loopback-only (127.0.0.1 or ::1)");
+    }
+
+    let base_url = format!(
+        "http://{}",
+        SocketAddr::from((args.admin_host, args.admin_port))
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client for daemon stop")?;
+
+    let shutdown_url = format!("{base_url}/shutdown");
+    if let Ok(response) = client.post(&shutdown_url).send().await
+        && response.status().is_success()
+    {
+        for _ in 0..30 {
+            if !admin_health_ok(&client, &base_url).await {
+                let _ = clear_daemon_state_file(&store);
+                println!("daemon stopped");
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    let Some(state) = read_daemon_state_file(&store)? else {
+        println!("daemon not running");
+        return Ok(());
+    };
+    if state.host != args.admin_host.to_string() || state.port != args.admin_port {
+        println!("daemon not running");
+        return Ok(());
+    }
+
+    if !process_exists(state.pid)? {
+        let _ = clear_daemon_state_file(&store);
+        println!("daemon not running");
+        return Ok(());
+    }
+
+    terminate_process(state.pid, "TERM")?;
+    for _ in 0..30 {
+        if !process_exists(state.pid)? {
+            let _ = clear_daemon_state_file(&store);
+            println!("daemon stopped");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if args.force {
+        terminate_process(state.pid, "KILL")?;
+        for _ in 0..20 {
+            if !process_exists(state.pid)? {
+                let _ = clear_daemon_state_file(&store);
+                println!("daemon force-stopped");
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    bail!("daemon is still running; rerun with --force")
+}
+
+async fn admin_health_ok(client: &reqwest::Client, base_url: &str) -> bool {
+    let health_url = format!("{base_url}/health");
+    match client.get(&health_url).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+fn daemon_state_file(store: &ConfigStore) -> PathBuf {
+    store.daemon_state_file()
+}
+
+fn read_daemon_state_file(store: &ConfigStore) -> Result<Option<DaemonStateRecord>> {
+    let path = daemon_state_file(store);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let parsed: DaemonStateRecord = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid daemon state in {}", path.display()))?;
+    Ok(Some(parsed))
+}
+
+fn clear_daemon_state_file(store: &ConfigStore) -> Result<()> {
+    let path = daemon_state_file(store);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn process_exists(pid: u32) -> Result<bool> {
+    let status = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .context("failed to execute 'kill -0'")?;
+    Ok(status.success())
+}
+
+fn terminate_process(pid: u32, signal: &str) -> Result<()> {
+    let status = std::process::Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("failed to execute 'kill -{signal}'"))?;
+    if !status.success() {
+        bail!("kill -{signal} failed for pid {pid}");
+    }
+    Ok(())
+}
+
+fn parse_transport_flag(raw: &str) -> Result<TransportMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(TransportMode::Auto),
+        "sse" => Ok(TransportMode::Sse),
+        "streamable-http" => Ok(TransportMode::StreamableHttp),
+        other => bail!("invalid transport '{other}', expected auto|sse|streamable-http"),
+    }
+}
+
+fn parse_exposure_flag(raw: &str) -> Result<ExposureMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "passthrough" | "full" => Ok(ExposureMode::Passthrough),
+        "compact" | "truncated" => Ok(ExposureMode::Compact),
+        "names-only" | "names" => Ok(ExposureMode::NamesOnly),
+        "server-only" | "server" => Ok(ExposureMode::ServerOnly),
+        other => {
+            bail!("invalid exposure '{other}', expected passthrough|compact|names-only|server-only")
+        }
     }
 }
