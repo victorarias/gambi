@@ -249,7 +249,7 @@ async fn gambi_discovers_and_calls_tools_over_legacy_sse() -> anyhow::Result<()>
     let result = client
         .call_tool(CallToolRequestParams {
             meta: None,
-            name: "gambi_execute".to_string().into(),
+            name: "gambi_execute_escalated".to_string().into(),
             arguments: Some(
                 json!({
                     "code": r#"

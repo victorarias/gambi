@@ -20,8 +20,9 @@ That kind of duct-tape-and-ingenuity solution has a name in Brazilian Portuguese
 
 - **Single MCP connection** — your agent talks to one stdio server and sees all upstream tools, namespaced (`github:search_issues`, `slack:post_message`)
 - **Aggregation** — tools, prompts, and resources from every upstream server, with automatic namespacing and routing
-- **`gambi_execute`** — a built-in tool that runs Python workflows calling any namespaced upstream tool via simple dot syntax (`github.search_issues(query="bug")`) — one tool call, many actions
+- **`gambi_execute` + `gambi_execute_escalated`** — safe-first execution with explicit escalation when workflows need higher-risk tools
 - **Admin UI** — web dashboard to add/remove servers, view tools, manage OAuth, override tool descriptions, and tail logs
+- **Execution policy controls** — classify each catalog as `heuristic`, `all-safe`, `all-escalated`, or `custom`, with per-tool overrides
 - **OAuth handling** — PKCE, token refresh/rotation, degraded-state reporting — all managed for you
 - **Tool description overrides** — rewrite what your agent sees for any upstream tool, useful when upstream descriptions are unhelpful
 
@@ -82,7 +83,7 @@ Or through the admin UI at `http://127.0.0.1:3333`.
 
 Your agent now sees all upstream tools prefixed with their server name. Ask it to call `github:search_issues` or `my-tool:do_something` — gambi routes the call to the right upstream server.
 
-For multi-step workflows, the agent can use `gambi_execute` to write a Python script that calls multiple tools in sequence:
+For multi-step workflows, the agent can use `gambi_execute` (safe mode) to write a Python script that calls multiple tools in sequence:
 
 ```python
 issues = github.search_issues(query="bug label:critical")
@@ -92,14 +93,37 @@ for issue in issues:
 
 One tool call instead of N+1 round-trips.
 
-## `gambi_execute`
+## Safe/ Escalated Execution Policy (What, Why, How)
 
-The execution tool lets your agent write Python scripts that call any upstream tool using dot syntax:
+**What**
+
+- `gambi_execute` is the safe execution path.
+- `gambi_execute_escalated` is the escalated execution path.
+- Every upstream tool gets an effective policy level: `safe` or `escalated`.
+
+**Why**
+
+- You can pre-approve low-risk workflows while still allowing privileged operations.
+- Agents get a deterministic escalation signal (`ESCALATION_REQUIRED`) instead of guessing.
+- Dynamic MCP catalogs stay manageable as tools appear/disappear.
+
+**How**
+
+- Catalog policy mode can be set to `heuristic`, `all-safe`, `all-escalated`, or `custom`.
+- In `custom`, set per-tool overrides (`safe`/`escalated`) for that catalog.
+- Default heuristic marks a tool as `safe` when:
+  - tool name starts with `get`, `list`, `search`, `lookup`, or `fetch` (case-insensitive), or
+  - description starts with `get` (case-insensitive).
+- If `gambi_execute` hits an escalated tool, it fails fast with `ESCALATION_REQUIRED`; rerun via `gambi_execute_escalated`.
+
+## Execution Tools
+
+Both execution tools let your agent write Python scripts that call upstream tools using dot syntax:
 
 ```python
 # <server>.<tool>(**kwargs)
-result = github.create_issue(title="Fix login", body="Login is broken")
-slack.post_message(channel="eng", text=f"Created: {result['url']}")
+result = github.get_issue(issue_id="123")
+slack.post_message(channel="eng", text=f"Issue loaded: {result['id']}")
 ```
 
 - Calls are namespaced: `server.tool(**kwargs)`
@@ -107,6 +131,8 @@ slack.post_message(channel="eng", text=f"Created: {result['url']}")
 - Upstream errors (`is_error=true`) fail the execution
 - Progress tokens are forwarded through nested calls
 - Runs on the [Monty](https://github.com/pydantic/monty) Python runtime with resource limits (not a sandbox)
+- `gambi_execute` enforces safe policy
+- `gambi_execute_escalated` bypasses safe-policy blocking (still subject to runtime limits)
 
 ## Admin UI
 
@@ -115,6 +141,7 @@ The admin panel runs on loopback only and gives you:
 - **Status** — health, exec status, server count, discovery failures
 - **Servers** — add/remove upstream MCP servers
 - **Tools** — see every tool your agent can access, with descriptions
+- **Policy** — catalog mode (`heuristic`, `all-safe`, `all-escalated`, `custom`) + per-tool policy overrides
 - **Overrides** — rewrite tool descriptions to help your agent understand what a tool does
 - **Auth** — OAuth status per server, start/refresh flows
 - **Logs** — tail recent server activity
@@ -128,9 +155,11 @@ API endpoints are also available directly: `/health`, `/status`, `/servers`, `/t
 ```bash
 gambi serve                        # start (default: admin on :3333, exec enabled)
 gambi serve --admin-port 4000      # custom admin port
-gambi serve --no-exec              # disable gambi_execute
+gambi serve --no-exec              # disable both execution tools
 gambi add <name> <url>             # add upstream server
+gambi add <name> <url> --policy all-escalated
 gambi remove <name>                # remove upstream server
+gambi policy <name> custom         # set catalog policy mode
 gambi list                         # list configured servers
 ```
 
@@ -140,7 +169,7 @@ Config directory: `~/.config/gambi/`
 
 | File | Purpose |
 |------|---------|
-| `config.json` | Servers and tool description overrides |
+| `config.json` | Servers, policy modes/overrides, and tool description overrides |
 | `tokens.json` | OAuth tokens (file-backed profiles) |
 
 Token storage profiles:
@@ -177,7 +206,7 @@ Token storage profiles:
 - MCP endpoint: stdio-only
 - Trust model: same OS user (any process under your user can access gambi)
 - Config/token files: `0600` permissions, `0700` config directory
-- `gambi_execute`: Monty runtime resource limits, not a full OS sandbox
+- `gambi_execute` / `gambi_execute_escalated`: Monty runtime resource limits, not a full OS sandbox
 
 ## Development
 

@@ -14,8 +14,10 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use tracing::{info, warn};
 
-use crate::config::{ConfigStore, ServerConfig};
+use crate::auth::AuthManager;
+use crate::config::{AppConfig, ConfigStore, ServerConfig, ToolPolicyLevel};
 use crate::namespacing::split_namespaced;
 use crate::upstream::{
     ProgressForwarder, UpstreamAuthHeaders, UpstreamManager, UpstreamRequestError,
@@ -29,6 +31,12 @@ const DEFAULT_MAX_CPU_SECONDS: u64 = 10;
 const DEFAULT_MAX_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_ALLOCATION_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_MAX_STDOUT_BYTES: usize = 1_048_576;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    Safe,
+    Escalated,
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecutionLimits {
@@ -68,6 +76,7 @@ pub struct ExecuteOutput {
 #[derive(Debug)]
 enum ExecutionError {
     Message(String),
+    EscalationRequired(String),
     Cancelled,
     Timeout,
 }
@@ -76,6 +85,7 @@ impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Message(message) => write!(f, "{message}"),
+            Self::EscalationRequired(message) => write!(f, "{message}"),
             Self::Cancelled => write!(f, "execution cancelled"),
             Self::Timeout => write!(f, "execution timed out"),
         }
@@ -87,6 +97,7 @@ pub async fn run_code_execution(
     store: &ConfigStore,
     upstream: &UpstreamManager,
     context: RequestContext<RoleServer>,
+    policy: ExecutionPolicy,
 ) -> Result<ExecuteOutput, McpError> {
     let cfg = store.load_async().await.map_err(|err| {
         McpError::internal_error(format!("failed to load config for execution: {err}"), None)
@@ -111,15 +122,19 @@ pub async fn run_code_execution(
 
     let limits = ExecutionLimits::default();
     let started = Instant::now();
-
-    let runtime = run_monty_execution_loop(
-        &script,
-        &servers_by_name,
-        &auth_headers,
+    let tool_descriptions = build_tool_description_index(&cfg, upstream, &auth_headers).await;
+    let runtime_context = RuntimeContext {
+        store,
+        cfg: &cfg,
+        servers_by_name: &servers_by_name,
+        auth_headers: &auth_headers,
+        tool_descriptions: &tool_descriptions,
+        policy,
         upstream,
-        &context,
-        &limits,
-    );
+        request_context: &context,
+    };
+
+    let runtime = run_monty_execution_loop(&script, &runtime_context, &limits);
 
     let (result, tool_calls, stdout) = match tokio::time::timeout(limits.max_wall, runtime).await {
         Ok(Ok(out)) => out,
@@ -135,12 +150,20 @@ pub async fn run_code_execution(
     })
 }
 
+struct RuntimeContext<'a> {
+    store: &'a ConfigStore,
+    cfg: &'a AppConfig,
+    servers_by_name: &'a HashMap<String, ServerConfig>,
+    auth_headers: &'a UpstreamAuthHeaders,
+    tool_descriptions: &'a HashMap<(String, String), String>,
+    policy: ExecutionPolicy,
+    upstream: &'a UpstreamManager,
+    request_context: &'a RequestContext<RoleServer>,
+}
+
 async fn run_monty_execution_loop(
     script: &str,
-    servers_by_name: &HashMap<String, ServerConfig>,
-    auth_headers: &UpstreamAuthHeaders,
-    upstream: &UpstreamManager,
-    context: &RequestContext<RoleServer>,
+    runtime: &RuntimeContext<'_>,
     limits: &ExecutionLimits,
 ) -> std::result::Result<(Value, usize, Vec<String>), ExecutionError> {
     let runner = MontyRun::new(
@@ -160,7 +183,7 @@ async fn run_monty_execution_loop(
     let mut tool_calls = 0usize;
 
     loop {
-        if context.ct.is_cancelled() {
+        if runtime.request_context.ct.is_cancelled() {
             return Err(ExecutionError::Cancelled);
         }
 
@@ -184,15 +207,8 @@ async fn run_monty_execution_loop(
 
                 let tool_call = parse_external_tool_call(args, kwargs)?;
                 tool_calls = tool_calls.saturating_add(1);
-                let result_json = handle_tool_call(
-                    tool_call.name,
-                    tool_call.arguments,
-                    servers_by_name,
-                    auth_headers,
-                    upstream,
-                    context,
-                )
-                .await?;
+                let result_json =
+                    handle_tool_call(tool_call.name, tool_call.arguments, runtime).await?;
 
                 let monty_result =
                     json_to_monty_object(&result_json).map_err(ExecutionError::Message)?;
@@ -268,10 +284,7 @@ fn parse_external_tool_call(
 async fn handle_tool_call(
     namespaced_name: String,
     arguments: Map<String, Value>,
-    servers_by_name: &HashMap<String, ServerConfig>,
-    auth_headers: &UpstreamAuthHeaders,
-    upstream: &UpstreamManager,
-    context: &RequestContext<RoleServer>,
+    runtime: &RuntimeContext<'_>,
 ) -> std::result::Result<Value, ExecutionError> {
     let Some((server_name, upstream_tool_name)) = split_namespaced(&namespaced_name) else {
         return Err(ExecutionError::Message(format!(
@@ -279,34 +292,106 @@ async fn handle_tool_call(
         )));
     };
 
-    let Some(server) = servers_by_name.get(server_name) else {
+    let Some(server) = runtime.servers_by_name.get(server_name) else {
         return Err(ExecutionError::Message(format!(
             "unknown tool namespace '{server_name}'"
         )));
     };
+    if runtime.policy == ExecutionPolicy::Safe {
+        let description = runtime
+            .tool_descriptions
+            .get(&(server_name.to_string(), upstream_tool_name.to_string()))
+            .map(String::as_str)
+            .or_else(|| {
+                runtime
+                    .cfg
+                    .tool_description_override_for(server_name, upstream_tool_name)
+            });
+        let decision =
+            runtime
+                .cfg
+                .evaluate_tool_policy(server_name, upstream_tool_name, description);
+        if decision.level == ToolPolicyLevel::Escalated {
+            let reason = format!(
+                "ESCALATION_REQUIRED: '{}' is policy-level '{}' (source '{}'). Re-run with gambi_execute_escalated or reclassify this tool in admin policy settings.",
+                namespaced_name,
+                decision.level.as_str(),
+                decision.source.as_str()
+            );
+            return Err(ExecutionError::EscalationRequired(reason));
+        }
+    }
 
     let request = CallToolRequestParams {
-        meta: Some(context.meta.clone()),
+        meta: Some(runtime.request_context.meta.clone()),
         name: upstream_tool_name.to_string().into(),
         arguments: Some(arguments),
         task: None,
     };
 
-    let progress_forwarder = context
+    let progress_forwarder = runtime
+        .request_context
         .meta
         .get_progress_token()
-        .map(|token| ProgressForwarder::new(context.peer.clone(), token));
+        .map(|token| ProgressForwarder::new(runtime.request_context.peer.clone(), token));
 
-    let result = upstream
+    let first_attempt = runtime
+        .upstream
         .call_tool_on_server(
             server,
-            auth_headers,
-            request,
-            context.ct.clone(),
-            progress_forwarder,
+            runtime.auth_headers,
+            request.clone(),
+            runtime.request_context.ct.clone(),
+            progress_forwarder.clone(),
         )
-        .await
-        .map_err(format_upstream_error)?;
+        .await;
+    let result = match first_attempt {
+        Ok(result) => result,
+        Err(err) if looks_like_auth_failure_error(&err) => {
+            let auth = AuthManager::new(runtime.store.clone());
+            match auth.refresh(server_name).await {
+                Ok(response) => {
+                    info!(
+                        server = server_name,
+                        refreshed = response.refreshed,
+                        expires_at_epoch_seconds = ?response.expires_at_epoch_seconds,
+                        "upstream tool call hit auth failure; oauth refresh succeeded, retrying"
+                    );
+                    runtime.upstream.invalidate_discovery_cache().await;
+                    let tokens: crate::auth::TokenState = runtime
+                        .store
+                        .load_tokens_async()
+                        .await
+                        .map_err(|load_err| {
+                        ExecutionError::Message(format!(
+                            "failed to load oauth token state after refresh: {load_err}"
+                        ))
+                    })?;
+                    let refreshed_headers = auth_headers_from_token_state(&tokens);
+                    runtime
+                        .upstream
+                        .call_tool_on_server(
+                            server,
+                            &refreshed_headers,
+                            request,
+                            runtime.request_context.ct.clone(),
+                            progress_forwarder,
+                        )
+                        .await
+                        .map_err(format_upstream_error)?
+                }
+                Err(refresh_err) => {
+                    warn!(
+                        server = server_name,
+                        error = %refresh_err,
+                        "upstream tool call hit auth failure; oauth refresh failed"
+                    );
+                    return Err(format_upstream_error(err));
+                }
+            }
+        }
+        Err(err) => return Err(format_upstream_error(err)),
+    };
     if result.is_error.unwrap_or(false) {
         return Err(ExecutionError::Message(format!(
             "upstream tool '{namespaced_name}' returned an error: {}",
@@ -341,12 +426,74 @@ fn format_upstream_error(err: UpstreamRequestError) -> ExecutionError {
     }
 }
 
+fn looks_like_auth_failure_error(err: &UpstreamRequestError) -> bool {
+    match err {
+        UpstreamRequestError::Protocol(protocol) => {
+            looks_like_auth_failure_message(protocol.message.as_ref())
+        }
+        UpstreamRequestError::Transport(transport) => {
+            looks_like_auth_failure_message(&transport.to_string())
+        }
+        UpstreamRequestError::Cancelled => false,
+    }
+}
+
+fn looks_like_auth_failure_message(message: &str) -> bool {
+    let msg = message.trim().to_ascii_lowercase();
+    msg.contains("invalid_token")
+        || msg.contains("invalid token")
+        || msg.contains("auth required")
+        || msg.contains("unauthorized")
+        || msg.contains("forbidden")
+        || msg.contains("401")
+        || msg.contains("403")
+}
+
 fn map_execution_error(err: ExecutionError) -> McpError {
     match err {
         ExecutionError::Cancelled => McpError::invalid_request("execution cancelled", None),
         ExecutionError::Timeout => McpError::invalid_request("execution timed out", None),
+        ExecutionError::EscalationRequired(message) => McpError::invalid_request(message, None),
         ExecutionError::Message(message) => McpError::invalid_request(message, None),
     }
+}
+
+async fn build_tool_description_index(
+    cfg: &AppConfig,
+    upstream: &UpstreamManager,
+    auth_headers: &UpstreamAuthHeaders,
+) -> HashMap<(String, String), String> {
+    let mut descriptions = HashMap::new();
+    let Ok(discovered) = upstream
+        .discover_tools_from_servers(&cfg.servers, auth_headers)
+        .await
+    else {
+        return descriptions;
+    };
+    for discovered_tool in discovered.tools {
+        let effective = cfg
+            .tool_description_override_for(
+                &discovered_tool.server_name,
+                &discovered_tool.upstream_name,
+            )
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                discovered_tool
+                    .tool
+                    .description
+                    .as_ref()
+                    .map(|value| value.to_string())
+            })
+            .unwrap_or_default();
+        descriptions.insert(
+            (
+                discovered_tool.server_name.clone(),
+                discovered_tool.upstream_name.clone(),
+            ),
+            effective,
+        );
+    }
+    descriptions
 }
 
 fn summarize_upstream_tool_error(result: &CallToolResult) -> String {
@@ -781,10 +928,15 @@ impl monty::PrintWriter for BoundedPrint {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
     use monty::MontyObject;
 
-    use super::{build_monty_script, parse_external_tool_call, rewrite_namespaced_tool_calls};
+    use super::{
+        build_monty_script, looks_like_auth_failure_error, looks_like_auth_failure_message,
+        parse_external_tool_call, rewrite_namespaced_tool_calls,
+    };
     use crate::config::ServerConfig;
+    use crate::upstream::UpstreamRequestError;
 
     #[test]
     fn script_builder_rewrites_server_tool_calls() {
@@ -909,6 +1061,22 @@ return fixture.fixture_echo(value=2)
         .expect("rewrite should succeed");
 
         assert!(rewritten.contains("return __gambi_call__(\"fixture:fixture_echo\")"));
+    }
+
+    #[test]
+    fn auth_failure_message_matcher_covers_common_cases() {
+        assert!(looks_like_auth_failure_message("invalid_token"));
+        assert!(looks_like_auth_failure_message("Auth required"));
+        assert!(looks_like_auth_failure_message("401 unauthorized"));
+        assert!(looks_like_auth_failure_message("403 forbidden"));
+        assert!(!looks_like_auth_failure_message("connection reset by peer"));
+    }
+
+    #[test]
+    fn auth_failure_error_matcher_detects_transport_errors() {
+        let err =
+            UpstreamRequestError::Transport(anyhow!("Auth required, when send initialize request"));
+        assert!(looks_like_auth_failure_error(&err));
     }
 
     #[test]

@@ -254,7 +254,7 @@ async fn execute(
     let result = client
         .call_tool(CallToolRequestParams {
             meta: None,
-            name: "gambi_execute".to_string().into(),
+            name: "gambi_execute_escalated".to_string().into(),
             arguments: Some(
                 serde_json::json!({ "code": code })
                     .as_object()

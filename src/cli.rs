@@ -8,7 +8,9 @@ use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 
 use crate::auth::{TokenState, prune_token_state_for_server_names};
-use crate::config::{AppConfig, ConfigStore, ExposureMode, ServerConfig, TransportMode};
+use crate::config::{
+    AppConfig, ConfigStore, ExposureMode, ServerConfig, ToolPolicyMode, TransportMode,
+};
 use crate::server;
 
 #[derive(Debug, Parser)]
@@ -24,6 +26,7 @@ enum Commands {
     Stop(StopArgs),
     Add(AddArgs),
     Exposure(ExposureArgs),
+    Policy(PolicyArgs),
     List,
     Remove(RemoveArgs),
     Export(ExportArgs),
@@ -61,6 +64,9 @@ struct AddArgs {
     /// Exposure mode for gambi_help: passthrough|compact|names-only|server-only.
     #[arg(long, default_value = "passthrough")]
     exposure: String,
+    /// Tool policy mode: heuristic|all-safe|all-escalated|custom.
+    #[arg(long, default_value = "heuristic")]
+    policy: String,
 }
 
 #[derive(Debug, Args)]
@@ -69,6 +75,14 @@ struct ExposureArgs {
     name: String,
     /// Exposure mode: passthrough|compact|names-only|server-only.
     exposure: String,
+}
+
+#[derive(Debug, Args)]
+struct PolicyArgs {
+    /// Configured server name.
+    name: String,
+    /// Policy mode: heuristic|all-safe|all-escalated|custom.
+    policy: String,
 }
 
 #[derive(Debug, Args)]
@@ -151,6 +165,20 @@ mod tests {
         assert!(debug.contains("exposure: \"names-only\""));
     }
 
+    #[test]
+    fn parses_add_with_policy_mode() {
+        let cli = Cli::parse_from([
+            "gambi",
+            "add",
+            "atlassian",
+            "https://mcp.atlassian.com/v1/sse",
+            "--policy",
+            "all-escalated",
+        ]);
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("policy: \"all-escalated\""));
+    }
+
     #[tokio::test]
     async fn rejects_non_loopback_admin_host() {
         let cli = Cli::parse_from(["gambi", "serve", "--admin-host", "0.0.0.0"]);
@@ -176,7 +204,9 @@ mod tests {
                     transport: Default::default(),
                     exposure_mode: Default::default(),
                 }],
+                server_tool_policy_modes: std::collections::BTreeMap::new(),
                 tool_description_overrides: std::collections::BTreeMap::new(),
+                tool_policy_overrides: std::collections::BTreeMap::new(),
             })
             .expect("config should persist");
 
@@ -256,6 +286,8 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
         Commands::Add(args) => {
             let transport = parse_transport_flag(&args.transport)?;
             let exposure_mode = parse_exposure_flag(&args.exposure)?;
+            let policy_mode = parse_policy_flag(&args.policy)?;
+            let server_name = args.name.clone();
             store.update(|cfg| {
                 cfg.add_server(ServerConfig {
                     name: args.name,
@@ -263,7 +295,8 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
                     oauth: None,
                     transport,
                     exposure_mode,
-                })
+                })?;
+                cfg.set_server_tool_policy_mode(&server_name, policy_mode)
             })?;
             println!("server added");
             Ok(())
@@ -275,6 +308,13 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
             println!("server exposure updated");
             Ok(())
         }
+        Commands::Policy(args) => {
+            let policy_mode = parse_policy_flag(&args.policy)?;
+            let server_name = args.name.clone();
+            store.update(move |cfg| cfg.set_server_tool_policy_mode(&server_name, policy_mode))?;
+            println!("server policy updated");
+            Ok(())
+        }
         Commands::List => {
             let cfg = store.load()?;
             if cfg.servers.is_empty() {
@@ -282,12 +322,14 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
                 return Ok(());
             }
 
-            for server in cfg.servers {
+            for server in &cfg.servers {
+                let policy = cfg.server_tool_policy_mode_for(&server.name);
                 println!(
-                    "{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}",
                     server.name,
                     server.url,
-                    server.exposure_mode.as_str()
+                    server.exposure_mode.as_str(),
+                    policy.as_str()
                 );
             }
             Ok(())
@@ -487,6 +529,18 @@ fn parse_exposure_flag(raw: &str) -> Result<ExposureMode> {
         "server-only" | "server" => Ok(ExposureMode::ServerOnly),
         other => {
             bail!("invalid exposure '{other}', expected passthrough|compact|names-only|server-only")
+        }
+    }
+}
+
+fn parse_policy_flag(raw: &str) -> Result<ToolPolicyMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "heuristic" => Ok(ToolPolicyMode::Heuristic),
+        "all-safe" | "safe" => Ok(ToolPolicyMode::AllSafe),
+        "all-escalated" | "escalated" => Ok(ToolPolicyMode::AllEscalated),
+        "custom" => Ok(ToolPolicyMode::Custom),
+        other => {
+            bail!("invalid policy '{other}', expected heuristic|all-safe|all-escalated|custom")
         }
     }
 }

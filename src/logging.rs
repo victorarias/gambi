@@ -29,7 +29,12 @@ impl LogBuffer {
             if normalized.is_empty() {
                 continue;
             }
-            self.push_line(normalized.to_string());
+            let cleaned = strip_ansi_escape_sequences(normalized);
+            let cleaned = cleaned.trim();
+            if cleaned.is_empty() {
+                continue;
+            }
+            self.push_line(cleaned.to_string());
         }
     }
 
@@ -105,6 +110,69 @@ impl Write for TeeWriter {
     }
 }
 
+fn strip_ansi_escape_sequences(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut output = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c != '\u{1b}' {
+            if !c.is_control() || c == '\t' {
+                output.push(c);
+            }
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= chars.len() {
+            break;
+        }
+
+        match chars[i] {
+            '[' => {
+                i += 1;
+                while i < chars.len() {
+                    let terminal = chars[i];
+                    if ('@'..='~').contains(&terminal) {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            ']' => {
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '\u{0007}' {
+                        i += 1;
+                        break;
+                    }
+                    if chars[i] == '\u{1b}' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            'P' | 'X' | '^' | '_' => {
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '\u{1b}' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::LogBuffer;
@@ -117,5 +185,17 @@ mod tests {
 
         assert_eq!(logs.recent_lines(10), vec!["two", "three", "four"]);
         assert_eq!(logs.recent_lines(2), vec!["three", "four"]);
+    }
+
+    #[test]
+    fn strips_ansi_escape_sequences() {
+        let logs = LogBuffer::new(10);
+        logs.append_bytes(b"\x1b[2m2026-02-16\x1b[0m \x1b[32mINFO\x1b[0m running\n");
+        logs.append_bytes(b"\x1b]8;;https://example.com\x1b\\label\x1b]8;;\x1b\\\n");
+
+        assert_eq!(
+            logs.recent_lines(10),
+            vec!["2026-02-16 INFO running", "label"]
+        );
     }
 }

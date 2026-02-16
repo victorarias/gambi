@@ -35,7 +35,7 @@ async fn gambi_forwards_tool_progress_notifications_for_routed_calls() -> anyhow
 
     let request = ClientRequest::CallToolRequest(Request::new(CallToolRequestParams {
         meta: None,
-        name: "gambi_execute".to_string().into(),
+        name: "gambi_execute_escalated".to_string().into(),
         arguments: Some(
             serde_json::json!({
                 "code": r#"

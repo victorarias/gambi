@@ -168,6 +168,74 @@ impl ExposureMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolPolicyMode {
+    #[default]
+    Heuristic,
+    AllSafe,
+    AllEscalated,
+    Custom,
+}
+
+impl ToolPolicyMode {
+    fn is_heuristic(&self) -> bool {
+        *self == Self::Heuristic
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Heuristic => "heuristic",
+            Self::AllSafe => "all-safe",
+            Self::AllEscalated => "all-escalated",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolPolicyLevel {
+    Safe,
+    Escalated,
+}
+
+impl ToolPolicyLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Escalated => "escalated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPolicySource {
+    System,
+    Heuristic,
+    Override,
+    CatalogAllSafe,
+    CatalogAllEscalated,
+}
+
+impl ToolPolicySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Heuristic => "heuristic",
+            Self::Override => "override",
+            Self::CatalogAllSafe => "catalog-all-safe",
+            Self::CatalogAllEscalated => "catalog-all-escalated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolPolicyDecision {
+    pub level: ToolPolicyLevel,
+    pub source: ToolPolicySource,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerConfig {
     pub name: String,
@@ -197,7 +265,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_tool_policy_modes: BTreeMap<String, ToolPolicyMode>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_description_overrides: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_policy_overrides: BTreeMap<String, BTreeMap<String, ToolPolicyLevel>>,
 }
 
 impl AppConfig {
@@ -228,7 +300,9 @@ impl AppConfig {
         self.servers.retain(|s| s.name != server_name);
         let removed = self.servers.len() != before;
         if removed {
+            self.server_tool_policy_modes.remove(server_name);
             self.tool_description_overrides.remove(server_name);
+            self.tool_policy_overrides.remove(server_name);
         }
         removed
     }
@@ -272,6 +346,115 @@ impl AppConfig {
             .or_default()
             .insert(tool_name.to_string(), description.to_string());
         Ok(())
+    }
+
+    pub fn set_server_tool_policy_mode(
+        &mut self,
+        server_name: &str,
+        policy_mode: ToolPolicyMode,
+    ) -> Result<()> {
+        if !self.servers.iter().any(|server| server.name == server_name) {
+            bail!("unknown server '{server_name}'");
+        }
+        if policy_mode.is_heuristic() {
+            self.server_tool_policy_modes.remove(server_name);
+        } else {
+            self.server_tool_policy_modes
+                .insert(server_name.to_string(), policy_mode);
+        }
+        Ok(())
+    }
+
+    pub fn server_tool_policy_mode_for(&self, server_name: &str) -> ToolPolicyMode {
+        self.server_tool_policy_modes
+            .get(server_name)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn set_tool_policy_override(
+        &mut self,
+        server_name: &str,
+        upstream_tool_name: &str,
+        level: ToolPolicyLevel,
+    ) -> Result<()> {
+        if !self.servers.iter().any(|server| server.name == server_name) {
+            bail!("unknown server '{server_name}'");
+        }
+        let tool_name = upstream_tool_name.trim();
+        if tool_name.is_empty() {
+            bail!("tool name cannot be empty");
+        }
+
+        self.tool_policy_overrides
+            .entry(server_name.to_string())
+            .or_default()
+            .insert(tool_name.to_string(), level);
+        Ok(())
+    }
+
+    pub fn remove_tool_policy_override(
+        &mut self,
+        server_name: &str,
+        upstream_tool_name: &str,
+    ) -> bool {
+        let tool_name = upstream_tool_name.trim();
+        let Some(overrides) = self.tool_policy_overrides.get_mut(server_name) else {
+            return false;
+        };
+        let removed = overrides.remove(tool_name).is_some();
+        if overrides.is_empty() {
+            self.tool_policy_overrides.remove(server_name);
+        }
+        removed
+    }
+
+    pub fn tool_policy_override_for(
+        &self,
+        server_name: &str,
+        upstream_tool_name: &str,
+    ) -> Option<ToolPolicyLevel> {
+        self.tool_policy_overrides
+            .get(server_name)
+            .and_then(|overrides| overrides.get(upstream_tool_name))
+            .copied()
+    }
+
+    pub fn evaluate_tool_policy(
+        &self,
+        server_name: &str,
+        upstream_tool_name: &str,
+        description: Option<&str>,
+    ) -> ToolPolicyDecision {
+        let mode = self.server_tool_policy_mode_for(server_name);
+        match mode {
+            ToolPolicyMode::AllSafe => ToolPolicyDecision {
+                level: ToolPolicyLevel::Safe,
+                source: ToolPolicySource::CatalogAllSafe,
+            },
+            ToolPolicyMode::AllEscalated => ToolPolicyDecision {
+                level: ToolPolicyLevel::Escalated,
+                source: ToolPolicySource::CatalogAllEscalated,
+            },
+            ToolPolicyMode::Custom | ToolPolicyMode::Heuristic => {
+                if let Some(level) = self.tool_policy_override_for(server_name, upstream_tool_name)
+                {
+                    return ToolPolicyDecision {
+                        level,
+                        source: ToolPolicySource::Override,
+                    };
+                }
+                let safe = tool_matches_safe_heuristic(upstream_tool_name, description);
+                ToolPolicyDecision {
+                    level: if safe {
+                        ToolPolicyLevel::Safe
+                    } else {
+                        ToolPolicyLevel::Escalated
+                    },
+                    source: ToolPolicySource::Heuristic,
+                }
+            }
+        }
     }
 
     pub fn remove_tool_description_override(
@@ -344,8 +527,47 @@ impl AppConfig {
                 }
             }
         }
+        for (server_name, mode) in &self.server_tool_policy_modes {
+            if !seen.contains(server_name) {
+                bail!("tool policy mode references unknown server '{server_name}'");
+            }
+            if mode.is_heuristic() {
+                bail!("tool policy mode for '{server_name}' should omit heuristic default");
+            }
+        }
+        for (server_name, overrides) in &self.tool_policy_overrides {
+            if !seen.contains(server_name) {
+                bail!("tool policy overrides reference unknown server '{server_name}'");
+            }
+            for upstream_tool_name in overrides.keys() {
+                if upstream_tool_name.trim().is_empty() {
+                    bail!("tool policy override has empty tool name for server '{server_name}'");
+                }
+            }
+        }
         Ok(())
     }
+}
+
+pub fn tool_matches_safe_heuristic(tool_name: &str, description: Option<&str>) -> bool {
+    let normalized_tool = tool_name
+        .rsplit(':')
+        .next()
+        .unwrap_or(tool_name)
+        .trim()
+        .to_ascii_lowercase();
+    const SAFE_PREFIXES: [&str; 5] = ["get", "list", "search", "lookup", "fetch"];
+    if SAFE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_tool.starts_with(prefix))
+    {
+        return true;
+    }
+
+    description
+        .map(str::trim_start)
+        .map(|value| value.to_ascii_lowercase().starts_with("get"))
+        .unwrap_or(false)
 }
 
 impl ConfigStore {
@@ -537,11 +759,24 @@ impl ConfigStore {
     fn load_unlocked(&self) -> Result<AppConfig> {
         self.ensure_layout()?;
 
-        let raw = fs::read_to_string(&self.paths.config_file)
+        let mut raw = fs::read_to_string(&self.paths.config_file)
             .with_context(|| format!("failed to read {}", self.paths.config_file.display()))?;
 
-        let cfg: AppConfig = serde_json::from_str(&raw)
-            .with_context(|| format!("invalid JSON in {}", self.paths.config_file.display()))?;
+        let cfg: AppConfig = match serde_json::from_str(&raw) {
+            Ok(parsed) => parsed,
+            Err(err) if raw.trim().is_empty() => {
+                // Concurrent first-writer bootstrap can momentarily expose an empty file.
+                thread::sleep(Duration::from_millis(10));
+                raw = fs::read_to_string(&self.paths.config_file).with_context(|| {
+                    format!("failed to read {}", self.paths.config_file.display())
+                })?;
+                serde_json::from_str(&raw).with_context(|| {
+                    format!("invalid JSON in {}", self.paths.config_file.display())
+                })?
+            }
+            Err(_) => serde_json::from_str(&raw)
+                .with_context(|| format!("invalid JSON in {}", self.paths.config_file.display()))?,
+        };
         cfg.validate().with_context(|| {
             format!(
                 "invalid server definitions in {}",
@@ -966,7 +1201,7 @@ fn enforce_owner_only_directory_permissions(path: &Path) -> Result<()> {
 mod tests {
     use super::{
         AppConfig, ConfigStore, OAuthConfig, RuntimeProfile, ServerConfig, TokenStorage,
-        TokenStorePreference,
+        TokenStorePreference, ToolPolicyLevel, ToolPolicyMode, tool_matches_safe_heuristic,
     };
     use std::collections::BTreeMap;
     #[cfg(unix)]
@@ -1160,6 +1395,54 @@ mod tests {
     }
 
     #[test]
+    fn tool_policy_heuristic_matches_name_and_description_prefixes() {
+        assert!(tool_matches_safe_heuristic("getIssue", None));
+        assert!(tool_matches_safe_heuristic("listIssues", None));
+        assert!(tool_matches_safe_heuristic(
+            "searchJiraIssuesUsingJql",
+            None
+        ));
+        assert!(tool_matches_safe_heuristic(
+            "randomTool",
+            Some("Get account profile")
+        ));
+        assert!(!tool_matches_safe_heuristic("createIssue", None));
+        assert!(!tool_matches_safe_heuristic(
+            "createIssue",
+            Some("Create a jira issue")
+        ));
+    }
+
+    #[test]
+    fn tool_policy_modes_and_overrides_apply_and_prune() {
+        let mut cfg = AppConfig::default();
+        cfg.add_server(ServerConfig {
+            name: "atlassian".to_string(),
+            url: "https://example.com/mcp".to_string(),
+            oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
+        })
+        .expect("valid server should be added");
+
+        cfg.set_server_tool_policy_mode("atlassian", ToolPolicyMode::AllEscalated)
+            .expect("mode should be set");
+        let decision = cfg.evaluate_tool_policy("atlassian", "getJiraIssue", Some("Get an issue"));
+        assert_eq!(decision.level, ToolPolicyLevel::Escalated);
+
+        cfg.set_server_tool_policy_mode("atlassian", ToolPolicyMode::Custom)
+            .expect("mode should be set");
+        cfg.set_tool_policy_override("atlassian", "createJiraIssue", ToolPolicyLevel::Safe)
+            .expect("override should be set");
+        let overridden = cfg.evaluate_tool_policy("atlassian", "createJiraIssue", None);
+        assert_eq!(overridden.level, ToolPolicyLevel::Safe);
+
+        assert!(cfg.remove_server("atlassian"));
+        assert!(cfg.server_tool_policy_modes.is_empty());
+        assert!(cfg.tool_policy_overrides.is_empty());
+    }
+
+    #[test]
     fn oauth_config_is_validated() {
         let mut cfg = AppConfig::default();
 
@@ -1262,7 +1545,9 @@ mod tests {
                 transport: Default::default(),
                 exposure_mode: Default::default(),
             }],
+            server_tool_policy_modes: BTreeMap::new(),
             tool_description_overrides: BTreeMap::new(),
+            tool_policy_overrides: BTreeMap::new(),
         };
         let err = store
             .replace(invalid)
@@ -1337,7 +1622,9 @@ mod tests {
                 transport: Default::default(),
                 exposure_mode: Default::default(),
             }],
+            server_tool_policy_modes: BTreeMap::new(),
             tool_description_overrides: BTreeMap::new(),
+            tool_policy_overrides: BTreeMap::new(),
         };
 
         let err = super::atomic_write_json_inner(

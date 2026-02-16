@@ -23,7 +23,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::auth::{AuthManager, AuthServerStatus, AuthStartResponse, TokenState};
-use crate::config::{AppConfig, ConfigStore, ExposureMode, ServerConfig};
+use crate::config::{
+    AppConfig, ConfigStore, ExposureMode, ServerConfig, ToolPolicyLevel, ToolPolicyMode,
+    ToolPolicySource,
+};
 use crate::logging;
 use crate::upstream;
 
@@ -78,7 +81,9 @@ struct StatusResponse {
 #[derive(Debug, Serialize)]
 struct ServersResponse {
     servers: Vec<ServerConfig>,
+    server_tool_policy_modes: BTreeMap<String, ToolPolicyMode>,
     tool_description_overrides: BTreeMap<String, BTreeMap<String, String>>,
+    tool_policy_overrides: BTreeMap<String, BTreeMap<String, ToolPolicyLevel>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +103,12 @@ struct ToolDiscoveryFailure {
 struct ToolDetail {
     name: String,
     description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_name: Option<String>,
+    policy_level: String,
+    policy_source: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,8 +145,40 @@ struct RemoveToolDescriptionOverrideRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ToolPolicyOverrideRequest {
+    server: String,
+    tool: String,
+    level: ToolPolicyLevel,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveToolPolicyOverrideRequest {
+    server: String,
+    tool: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct UpdateServerExposureRequest {
     exposure_mode: ExposureMode,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateServerToolPolicyRequest {
+    policy_mode: ToolPolicyMode,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddServerRequest {
+    name: String,
+    url: String,
+    #[serde(default)]
+    oauth: Option<crate::config::OAuthConfig>,
+    #[serde(default)]
+    transport: crate::config::TransportMode,
+    #[serde(default)]
+    exposure_mode: crate::config::ExposureMode,
+    #[serde(default)]
+    policy_mode: crate::config::ToolPolicyMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +286,7 @@ pub async fn run(
         .route("/status", get(status))
         .route("/servers", get(servers).post(add_server))
         .route("/servers/{name}/exposure", post(update_server_exposure))
+        .route("/servers/{name}/policy", post(update_server_tool_policy))
         .route("/servers/{name}", delete(remove_server))
         .route("/tools", get(tools))
         .route("/tool-descriptions", post(set_tool_description_override))
@@ -250,6 +294,8 @@ pub async fn run(
             "/tool-descriptions/remove",
             post(remove_tool_description_override),
         )
+        .route("/tool-policies", post(set_tool_policy_override))
+        .route("/tool-policies/remove", post(remove_tool_policy_override))
         .route("/logs", get(logs))
         .route("/config/export", get(export_config))
         .route("/config/import", post(import_config))
@@ -368,6 +414,16 @@ async fn root() -> Html<&'static str> {
     .t-name { color: var(--text); font-weight: 500; }
     .t-ns { color: var(--text-3); }
     .t-desc { color: var(--text-3); font-size: 11px; }
+    .p-row { display: flex; flex-direction: column; gap: 4px; padding: 8px 0; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 11px; }
+    .p-row:last-child { border-bottom: 0; }
+    .po-top { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+    .po-name { color: var(--text); min-width: 0; overflow-wrap: anywhere; }
+    .po-config { display: flex; gap: 6px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+    .po-desc { color: var(--text-3); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .pill { border: 1px solid var(--border); border-radius: 100px; padding: 1px 8px; font-size: 10px; color: var(--text-2); justify-self: start; }
+    .pill-safe { border-color: rgba(74,222,128,0.35); color: var(--green); background: rgba(74,222,128,0.08); }
+    .pill-esc { border-color: rgba(248,113,113,0.35); color: var(--red); background: rgba(248,113,113,0.08); }
+    .pill-src { color: var(--text-3); }
 
     .fail { padding: 6px 8px; background: var(--red-bg); border-radius: var(--r-sm); font-family: var(--mono); font-size: 11px; color: var(--red); margin-bottom: 8px; }
 
@@ -445,6 +501,12 @@ async fn root() -> Html<&'static str> {
               <option value="names-only">names-only</option>
               <option value="server-only">server-only</option>
             </select>
+            <select id="server-policy-add">
+              <option value="heuristic">heuristic</option>
+              <option value="all-safe">all-safe</option>
+              <option value="all-escalated">all-escalated</option>
+              <option value="custom">custom</option>
+            </select>
           </div>
           <button type="submit">Add Server</button>
         </form>
@@ -484,29 +546,66 @@ async fn root() -> Html<&'static str> {
     </section>
 
     <section class="panel">
-      <div class="ph"><h2>Overrides</h2><button class="raw-btn" onclick="toggleRaw(this,'overrides')">json</button></div>
+      <div class="ph"><h2>Policy & Overrides</h2><button class="raw-btn" onclick="toggleRaw(this,'policies')">json</button></div>
       <div class="pb">
-        <div id="overrides-view"></div>
+        <div id="policies-view"></div>
+        <pre id="policies" class="raw">loading...</pre>
+        <div id="overrides-view" style="margin-top:10px;"></div>
         <pre id="overrides" class="raw">loading...</pre>
-        <div class="note">Overrides apply to tool discovery responses sent to connected agents.</div>
+        <div class="note">Default safe heuristic: tool name starts with get/list/search/lookup/fetch, or description starts with get.</div>
       </div>
       <div class="pf">
+        <form id="server-policy-mode-form">
+          <span class="f-label">catalog policy mode</span>
+          <div class="row">
+            <select id="policy-server-mode-name"></select>
+            <select id="policy-server-mode">
+              <option value="heuristic">heuristic</option>
+              <option value="all-safe">all-safe</option>
+              <option value="all-escalated">all-escalated</option>
+              <option value="custom">custom</option>
+            </select>
+          </div>
+          <button type="submit">Set Catalog Mode</button>
+        </form>
+        <form id="policy-override-set-form">
+          <span class="f-label">set tool policy override</span>
+          <div class="row">
+            <select id="policy-override-server"></select>
+            <input id="policy-override-tool" placeholder="upstream tool name (e.g. search_issues)" required>
+          </div>
+          <div class="row">
+            <select id="policy-override-level">
+              <option value="safe">safe</option>
+              <option value="escalated">escalated</option>
+            </select>
+          </div>
+          <button type="submit">Save Policy Override</button>
+        </form>
+        <form id="policy-override-remove-form">
+          <span class="f-label">remove tool policy override</span>
+          <div class="row">
+            <select id="policy-override-remove-server"></select>
+            <input id="policy-override-remove-tool" placeholder="upstream tool name to remove" required>
+          </div>
+          <button type="submit" class="btn-d">Remove Policy Override</button>
+        </form>
         <form id="override-set-form">
-          <span class="f-label">set override</span>
+          <span class="f-label">set description override</span>
           <div class="row">
             <select id="override-server"></select>
             <input id="override-tool" placeholder="upstream tool name (e.g. search_issues)" required>
           </div>
           <input id="override-description" placeholder="description sent to MCP clients" required>
-          <button type="submit">Save Override</button>
+          <button type="submit">Save Description Override</button>
         </form>
         <form id="override-remove-form">
-          <span class="f-label">remove override</span>
+          <span class="f-label">remove description override</span>
           <div class="row">
             <select id="override-remove-server"></select>
             <input id="override-remove-tool" placeholder="upstream tool name to remove" required>
           </div>
-          <button type="submit" class="btn-d">Remove Override</button>
+          <button type="submit" class="btn-d">Remove Description Override</button>
         </form>
       </div>
     </section>
@@ -534,7 +633,8 @@ async fn root() -> Html<&'static str> {
     let REFRESH_INTERVAL_MS = 3000;
     let panelState = {
       toolsPayload: null,
-      toolsRefreshAtMs: 0
+      toolsRefreshAtMs: 0,
+      serverPolicyModes: {}
     };
 
     function esc(s) {
@@ -603,10 +703,27 @@ async fn root() -> Html<&'static str> {
       document.getElementById('server-exposure-name').disabled = !hasServers;
       document.getElementById('server-exposure-mode').disabled = !hasServers;
       document.querySelector('#server-exposure-form button[type=submit]').disabled = !hasServers;
+      document.getElementById('policy-server-mode-name').disabled = !hasServers;
+      document.getElementById('policy-server-mode').disabled = !hasServers;
+      document.querySelector('#server-policy-mode-form button[type=submit]').disabled = !hasServers;
+      document.getElementById('policy-override-server').disabled = !hasServers;
+      document.getElementById('policy-override-level').disabled = !hasServers;
+      document.querySelector('#policy-override-set-form button[type=submit]').disabled = !hasServers;
+      document.getElementById('policy-override-remove-server').disabled = !hasServers;
+      document.querySelector('#policy-override-remove-form button[type=submit]').disabled = !hasServers;
       document.getElementById('override-server').disabled = !hasServers;
       document.querySelector('#override-set-form button[type=submit]').disabled = !hasServers;
       document.getElementById('override-remove-server').disabled = !hasServers;
       document.querySelector('#override-remove-form button[type=submit]').disabled = !hasServers;
+    }
+
+    function syncSelectedServerPolicyMode() {
+      const selectServer = document.getElementById('policy-server-mode-name');
+      const selectMode = document.getElementById('policy-server-mode');
+      if (!selectServer || !selectMode) return;
+      const serverName = selectServer.value;
+      const mode = (panelState.serverPolicyModes && panelState.serverPolicyModes[serverName]) || 'heuristic';
+      selectMode.value = mode;
     }
 
     async function fetchJson(path, label) {
@@ -646,7 +763,8 @@ async fn root() -> Html<&'static str> {
       }
       v.innerHTML = servers.map(function(s) {
         const exposure = s.exposure_mode || 'passthrough';
-        return '<div class="v-item"><span class="v-name">' + esc(s.name) + '</span><span class="v-det">' + esc(s.url) + ' · ' + esc(exposure) + '</span></div>';
+        const policy = (panelState.serverPolicyModes && panelState.serverPolicyModes[s.name]) || 'heuristic';
+        return '<div class="v-item"><span class="v-name">' + esc(s.name) + '</span><span class="v-det">' + esc(s.url) + ' · exposure=' + esc(exposure) + ' · policy=' + esc(policy) + '</span></div>';
       }).join('');
     }
 
@@ -679,6 +797,52 @@ async fn root() -> Html<&'static str> {
       v.innerHTML = h;
     }
 
+    function renderPoliciesView(toolsPayload, serversPayload) {
+      const v = document.getElementById('policies-view');
+      const servers = Array.isArray(currentServers) ? currentServers : [];
+      if (!servers.length) {
+        v.innerHTML = '<div class="v-empty">no policy data</div>';
+        return;
+      }
+      const byServer = {};
+      const details = (toolsPayload && Array.isArray(toolsPayload.tool_details)) ? toolsPayload.tool_details : [];
+      for (let i = 0; i < details.length; i++) {
+        const t = details[i];
+        if (!t || !t.server) continue;
+        if (!byServer[t.server]) byServer[t.server] = [];
+        byServer[t.server].push(t);
+      }
+      const serverModes = (serversPayload && serversPayload.server_tool_policy_modes) || {};
+      const policyOverrides = (serversPayload && serversPayload.tool_policy_overrides) || {};
+      let h = '';
+      for (let i = 0; i < servers.length; i++) {
+        const serverName = servers[i].name;
+        const mode = serverModes[serverName] || 'heuristic';
+        const tools = (byServer[serverName] || []).slice().sort(function(a, b) {
+          return (a.upstream_name || '').localeCompare(b.upstream_name || '');
+        });
+        const safeCount = tools.filter(function(t) { return t.policy_level === 'safe'; }).length;
+        const escalatedCount = tools.length - safeCount;
+        const overrideCount = Object.keys(policyOverrides[serverName] || {}).length;
+        h += '<div class="t-row"><span class="t-name">' + esc(serverName) + '</span><span class="t-desc">mode=' + esc(mode) + ' · safe=' + safeCount + ' · escalated=' + escalatedCount + ' · overrides=' + overrideCount + '</span></div>';
+        if (!tools.length) {
+          h += '<div class="v-item"><span class="v-det">no discovered tools</span></div>';
+          continue;
+        }
+        for (let j = 0; j < tools.length; j++) {
+          const level = tools[j].policy_level || 'escalated';
+          const source = tools[j].policy_source || 'heuristic';
+          const levelClass = level === 'safe' ? 'pill-safe' : 'pill-esc';
+          const toolName = tools[j].upstream_name || tools[j].name || '';
+          h += '<div class="p-row">';
+          h += '<div class="po-top"><span class="po-name"><span class="t-ns">' + esc(serverName) + ':</span>' + esc(toolName) + '</span><span class="po-config"><span class="pill ' + levelClass + '">' + esc(level) + '</span><span class="pill pill-src">' + esc(source) + '</span></span></div>';
+          h += '<div class="po-desc">' + esc(tools[j].description || '') + '</div>';
+          h += '</div>';
+        }
+      }
+      v.innerHTML = h;
+    }
+
     function renderOverridesView(overrides) {
       const v = document.getElementById('overrides-view');
       if (!overrides || !Object.keys(overrides).length) {
@@ -690,7 +854,10 @@ async fn root() -> Html<&'static str> {
       for (let i = 0; i < srvs.length; i++) {
         const tools = Object.keys(overrides[srvs[i]]).sort();
         for (let j = 0; j < tools.length; j++) {
-          h += '<div class="t-row"><span class="t-name"><span class="t-ns">' + esc(srvs[i]) + ':</span>' + esc(tools[j]) + '</span><span class="t-desc">' + esc(overrides[srvs[i]][tools[j]]) + '</span></div>';
+          h += '<div class="p-row">';
+          h += '<div class="po-top"><span class="po-name"><span class="t-ns">' + esc(srvs[i]) + ':</span>' + esc(tools[j]) + '</span><span class="po-config"><span class="pill pill-src">description override</span></span></div>';
+          h += '<div class="po-desc">' + esc(overrides[srvs[i]][tools[j]]) + '</div>';
+          h += '</div>';
         }
       }
       v.innerHTML = h;
@@ -763,9 +930,14 @@ async fn root() -> Html<&'static str> {
           panelState.toolsRefreshAtMs = Date.now();
         }
         currentServers = serversPayload.servers || [];
+        panelState.serverPolicyModes = serversPayload.server_tool_policy_modes || {};
         document.getElementById('status').textContent = JSON.stringify(statusPayload, null, 2);
         document.getElementById('tools').textContent = JSON.stringify(panelState.toolsPayload || {}, null, 2);
         document.getElementById('servers').textContent = JSON.stringify(currentServers, null, 2);
+        document.getElementById('policies').textContent = JSON.stringify({
+          server_tool_policy_modes: serversPayload.server_tool_policy_modes || {},
+          tool_policy_overrides: serversPayload.tool_policy_overrides || {}
+        }, null, 2);
         document.getElementById('overrides').textContent = JSON.stringify(serversPayload.tool_description_overrides || {}, null, 2);
         document.getElementById('logs').textContent = (logsPayload.logs || []).join('\n');
         document.getElementById('auth').textContent = JSON.stringify(authPayload, null, 2);
@@ -773,14 +945,19 @@ async fn root() -> Html<&'static str> {
         renderStatusBar(statusPayload);
         renderServersView(currentServers);
         renderToolsView(panelState.toolsPayload);
+        renderPoliciesView(panelState.toolsPayload, serversPayload);
         renderOverridesView(serversPayload.tool_description_overrides || {});
         renderAuthView(authPayload);
 
         setServerOptions('server-remove-name', currentServers);
         setServerOptions('server-exposure-name', currentServers);
+        setServerOptions('policy-server-mode-name', currentServers);
+        setServerOptions('policy-override-server', currentServers);
+        setServerOptions('policy-override-remove-server', currentServers);
         setServerOptions('override-server', currentServers);
         setServerOptions('override-remove-server', currentServers);
         setMutationFormState();
+        syncSelectedServerPolicyMode();
       } catch (error) {
         setError('refresh failed: ' + (error instanceof Error ? error.message : String(error)));
       } finally {
@@ -823,7 +1000,8 @@ async fn root() -> Html<&'static str> {
         await postJson('/servers', {
           name: document.getElementById('server-name').value,
           url: document.getElementById('server-url').value,
-          exposure_mode: document.getElementById('server-exposure-add').value
+          exposure_mode: document.getElementById('server-exposure-add').value,
+          policy_mode: document.getElementById('server-policy-add').value
         });
         event.target.reset();
         await refresh({ forceTools: true });
@@ -844,6 +1022,24 @@ async fn root() -> Html<&'static str> {
       });
     });
 
+    document.getElementById('policy-server-mode-name').addEventListener('change', function() {
+      syncSelectedServerPolicyMode();
+    });
+
+    document.getElementById('server-policy-mode-form').addEventListener('submit', async function(event) {
+      event.preventDefault();
+      await runAction('set catalog policy mode', async function() {
+        const name = document.getElementById('policy-server-mode-name').value;
+        if (!name) {
+          throw new Error('no server selected');
+        }
+        await postJson('/servers/' + encodeURIComponent(name) + '/policy', {
+          policy_mode: document.getElementById('policy-server-mode').value
+        });
+        await refresh({ forceTools: true });
+      });
+    });
+
     document.getElementById('server-remove-form').addEventListener('submit', async function(event) {
       event.preventDefault();
       await runAction('remove server', async function() {
@@ -852,6 +1048,39 @@ async fn root() -> Html<&'static str> {
           throw new Error('no server selected');
         }
         await deletePath('/servers/' + encodeURIComponent(name));
+        await refresh({ forceTools: true });
+      });
+    });
+
+    document.getElementById('policy-override-set-form').addEventListener('submit', async function(event) {
+      event.preventDefault();
+      await runAction('save policy override', async function() {
+        const server = document.getElementById('policy-override-server').value;
+        if (!server) {
+          throw new Error('no server selected');
+        }
+        await postJson('/tool-policies', {
+          server: server,
+          tool: document.getElementById('policy-override-tool').value,
+          level: document.getElementById('policy-override-level').value
+        });
+        event.target.reset();
+        await refresh({ forceTools: true });
+      });
+    });
+
+    document.getElementById('policy-override-remove-form').addEventListener('submit', async function(event) {
+      event.preventDefault();
+      await runAction('remove policy override', async function() {
+        const server = document.getElementById('policy-override-remove-server').value;
+        if (!server) {
+          throw new Error('no server selected');
+        }
+        await postJson('/tool-policies/remove', {
+          server: server,
+          tool: document.getElementById('policy-override-remove-tool').value
+        });
+        event.target.reset();
         await refresh({ forceTools: true });
       });
     });
@@ -928,18 +1157,32 @@ async fn servers(State(state): State<AppState>) -> Result<Json<ServersResponse>,
     let cfg = load_config(&state).await?;
     Ok(Json(ServersResponse {
         servers: cfg.servers,
+        server_tool_policy_modes: cfg.server_tool_policy_modes,
         tool_description_overrides: cfg.tool_description_overrides,
+        tool_policy_overrides: cfg.tool_policy_overrides,
     }))
 }
 
 async fn add_server(
     State(state): State<AppState>,
-    Json(server): Json<ServerConfig>,
+    Json(request): Json<AddServerRequest>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    let server_name = server.name.clone();
+    let server_name = request.name.clone();
+    let server_name_for_update = server_name.clone();
+    let policy_mode = request.policy_mode;
+    let server = ServerConfig {
+        name: request.name,
+        url: request.url,
+        oauth: request.oauth,
+        transport: request.transport,
+        exposure_mode: request.exposure_mode,
+    };
     state
         .store
-        .update_async(move |cfg| cfg.add_server(server))
+        .update_async(move |cfg| {
+            cfg.add_server(server)?;
+            cfg.set_server_tool_policy_mode(&server_name_for_update, policy_mode)
+        })
         .await
         .map_err(|err| {
             error!(error = %err, server = %server_name, "failed to add server");
@@ -1004,6 +1247,28 @@ async fn update_server_exposure(
     Ok(Json(MutationResponse { status: "ok" }))
 }
 
+async fn update_server_tool_policy(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(request): Json<UpdateServerToolPolicyRequest>,
+) -> Result<Json<MutationResponse>, ApiError> {
+    let target_name = name.clone();
+    state
+        .store
+        .update_async(move |cfg| cfg.set_server_tool_policy_mode(&target_name, request.policy_mode))
+        .await
+        .map_err(|err| {
+            error!(
+                error = %err,
+                server = %name,
+                "failed to update server tool policy mode"
+            );
+            ApiError::bad_request(format!("failed to update policy mode: {err}"))
+        })?;
+    state.upstream.invalidate_discovery_cache().await;
+    Ok(Json(MutationResponse { status: "ok" }))
+}
+
 async fn set_tool_description_override(
     State(state): State<AppState>,
     Json(request): Json<ToolDescriptionOverrideRequest>,
@@ -1053,6 +1318,59 @@ async fn remove_tool_description_override(
 
     if !removed {
         return Err(ApiError::bad_request("override not found"));
+    }
+    state.upstream.invalidate_discovery_cache().await;
+
+    Ok(Json(MutationResponse { status: "ok" }))
+}
+
+async fn set_tool_policy_override(
+    State(state): State<AppState>,
+    Json(request): Json<ToolPolicyOverrideRequest>,
+) -> Result<Json<MutationResponse>, ApiError> {
+    let req_server = request.server.clone();
+    let req_tool = request.tool.clone();
+    let req_level = request.level;
+    state
+        .store
+        .update_async(move |cfg| cfg.set_tool_policy_override(&req_server, &req_tool, req_level))
+        .await
+        .map_err(|err| {
+            error!(
+                error = %err,
+                server = %request.server,
+                tool = %request.tool,
+                "failed to set tool policy override"
+            );
+            ApiError::bad_request(format!("failed to set tool policy override: {err}"))
+        })?;
+    state.upstream.invalidate_discovery_cache().await;
+
+    Ok(Json(MutationResponse { status: "ok" }))
+}
+
+async fn remove_tool_policy_override(
+    State(state): State<AppState>,
+    Json(request): Json<RemoveToolPolicyOverrideRequest>,
+) -> Result<Json<MutationResponse>, ApiError> {
+    let req_server = request.server.clone();
+    let req_tool = request.tool.clone();
+    let removed = state
+        .store
+        .update_async(move |cfg| Ok(cfg.remove_tool_policy_override(&req_server, &req_tool)))
+        .await
+        .map_err(|err| {
+            error!(
+                error = %err,
+                server = %request.server,
+                tool = %request.tool,
+                "failed to remove tool policy override"
+            );
+            ApiError::internal("failed to remove tool policy override")
+        })?;
+
+    if !removed {
+        return Err(ApiError::bad_request("policy override not found"));
     }
     state.upstream.invalidate_discovery_cache().await;
 
@@ -1127,7 +1445,7 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
         });
     }
 
-    let mut tool_details = BTreeMap::<String, String>::new();
+    let mut tool_details = BTreeMap::<String, ToolDetail>::new();
     for tool in &discovery.tools {
         let description = cfg
             .tool_description_override_for(&tool.server_name, &tool.upstream_name)
@@ -1139,27 +1457,86 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
                     .map(|value| value.to_string())
             })
             .unwrap_or_default();
-        tool_details.insert(tool.namespaced_name.clone(), description);
+        let policy = cfg.evaluate_tool_policy(
+            &tool.server_name,
+            &tool.upstream_name,
+            Some(description.as_str()),
+        );
+        tool_details.insert(
+            tool.namespaced_name.clone(),
+            ToolDetail {
+                name: tool.namespaced_name.clone(),
+                description,
+                server: Some(tool.server_name.clone()),
+                upstream_name: Some(tool.upstream_name.clone()),
+                policy_level: policy.level.as_str().to_string(),
+                policy_source: policy.source.as_str().to_string(),
+            },
+        );
     }
 
     tool_details.insert(
         "gambi_list_servers".to_string(),
-        "List configured upstream servers".to_string(),
+        ToolDetail {
+            name: "gambi_list_servers".to_string(),
+            description: "List configured upstream servers".to_string(),
+            server: None,
+            upstream_name: None,
+            policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
+            policy_source: ToolPolicySource::System.as_str().to_string(),
+        },
     );
     tool_details.insert(
         "gambi_list_upstream_tools".to_string(),
-        "Discover upstream tool names and discovery failures for troubleshooting".to_string(),
+        ToolDetail {
+            name: "gambi_list_upstream_tools".to_string(),
+            description: "Discover upstream tool names and discovery failures for troubleshooting"
+                .to_string(),
+            server: None,
+            upstream_name: None,
+            policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
+            policy_source: ToolPolicySource::System.as_str().to_string(),
+        },
     );
     tool_details.insert(
         "gambi_help".to_string(),
-        "Explain upstream MCP capabilities and return full tool metadata on demand (execute-only workflow)"
-            .to_string(),
+        ToolDetail {
+            name: "gambi_help".to_string(),
+            description:
+                "Explain upstream MCP capabilities and return full tool metadata on demand (execute-only workflow)"
+                    .to_string(),
+            server: None,
+            upstream_name: None,
+            policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
+            policy_source: ToolPolicySource::System.as_str().to_string(),
+        },
     );
     if state.exec_enabled {
         tool_details.insert(
             "gambi_execute".to_string(),
-            "Execute Python workflow in gambi (Monty runtime) with tool-call bridge and resource limits"
-                .to_string(),
+            ToolDetail {
+                name: "gambi_execute".to_string(),
+                description:
+                    "Safe execution path with policy-aware tool-call bridge; escalated calls are blocked with ESCALATION_REQUIRED"
+                        .to_string(),
+                server: None,
+                upstream_name: None,
+                policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
+                policy_source: ToolPolicySource::System.as_str().to_string(),
+            },
+        );
+        tool_details.insert(
+            "gambi_execute_escalated".to_string(),
+            ToolDetail {
+                name: "gambi_execute_escalated".to_string(),
+                description:
+                    "Escalated execution path for workflows that require non-safe upstream tools"
+                        .to_string(),
+                server: None,
+                upstream_name: None,
+                policy_level: ToolPolicyLevel::Escalated.as_str().to_string(),
+                policy_source: ToolPolicySource::System.as_str().to_string(),
+            },
         );
     }
 
@@ -1174,23 +1551,24 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
 
     let tools = tool_details.keys().cloned().collect::<Vec<_>>();
     let has_gambi_execute = tools.iter().any(|tool| tool == "gambi_execute");
-    if state.exec_enabled && !has_gambi_execute {
+    let has_gambi_execute_escalated = tools.iter().any(|tool| tool == "gambi_execute_escalated");
+    if state.exec_enabled && (!has_gambi_execute || !has_gambi_execute_escalated) {
         warn!(
             tool_count = tools.len(),
             failure_count = failures.len(),
-            "admin tools snapshot missing gambi_execute while exec mode is enabled"
+            has_gambi_execute,
+            has_gambi_execute_escalated,
+            "admin tools snapshot missing execute tool(s) while exec mode is enabled"
         );
     }
     info!(
         tool_count = tools.len(),
         failure_count = failures.len(),
         has_gambi_execute,
+        has_gambi_execute_escalated,
         "admin tools snapshot prepared"
     );
-    let tool_details = tool_details
-        .into_iter()
-        .map(|(name, description)| ToolDetail { name, description })
-        .collect::<Vec<_>>();
+    let tool_details = tool_details.into_values().collect::<Vec<_>>();
 
     Ok(Json(ToolsResponse {
         tools,

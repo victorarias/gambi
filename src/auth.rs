@@ -1246,7 +1246,9 @@ mod tests {
                 transport: Default::default(),
                 exposure_mode: Default::default(),
             }],
+            server_tool_policy_modes: std::collections::BTreeMap::new(),
             tool_description_overrides: std::collections::BTreeMap::new(),
+            tool_policy_overrides: std::collections::BTreeMap::new(),
         };
         store.replace(cfg).expect("config should persist");
 
@@ -1268,7 +1270,9 @@ mod tests {
                     transport: Default::default(),
                     exposure_mode: Default::default(),
                 }],
+                server_tool_policy_modes: std::collections::BTreeMap::new(),
                 tool_description_overrides: std::collections::BTreeMap::new(),
+                tool_policy_overrides: std::collections::BTreeMap::new(),
             })
             .expect("config should persist");
 
@@ -1313,7 +1317,9 @@ mod tests {
                     transport: Default::default(),
                     exposure_mode: Default::default(),
                 }],
+                server_tool_policy_modes: std::collections::BTreeMap::new(),
                 tool_description_overrides: std::collections::BTreeMap::new(),
+                tool_policy_overrides: std::collections::BTreeMap::new(),
             })
             .expect("config should persist");
 
