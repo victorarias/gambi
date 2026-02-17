@@ -361,7 +361,7 @@ test.describe("admin UI", () => {
     }
   });
 
-  test("supports click-to-save policy pills", async ({ page }) => {
+  test("supports click-to-save level policy pills", async ({ page }) => {
     const binPath = resolveGambiBin();
     if (!(await ensurePathExists(binPath))) {
       throw new Error(
@@ -384,12 +384,12 @@ test.describe("admin UI", () => {
       const levelPill = page.locator(
         '#policies-view button[data-action="toggle-policy-level"][data-server="fixture"][data-tool="fixture_echo"]',
       );
-      const sourcePill = page.locator(
-        '#policies-view button[data-action="toggle-policy-source"][data-server="fixture"][data-tool="fixture_echo"]',
-      );
-
       await expect(levelPill).toBeVisible();
-      await expect(sourcePill).toBeVisible();
+      await expect(
+        page.locator(
+          '#policies-view button[data-action="toggle-policy-source"][data-server="fixture"][data-tool="fixture_echo"]',
+        ),
+      ).toHaveCount(0);
 
       const initialLevel = ((await levelPill.textContent()) || "").trim();
       expect(["safe", "escalated"]).toContain(initialLevel);
@@ -406,20 +406,9 @@ test.describe("admin UI", () => {
         })
         .toBe(toggledLevel);
 
-      await expect(sourcePill).toHaveText("override");
-
-      await sourcePill.click();
-
-      await expect
-        .poll(async () => {
-          const policies = await readJsonPre(page, "policies");
-          if (!policies || !policies.tool_policy_overrides) return "__missing__";
-          const byServer = policies.tool_policy_overrides.fixture || {};
-          return byServer.fixture_echo || "__missing__";
-        })
-        .toBe("__missing__");
-
-      await expect(sourcePill).toHaveText("heuristic");
+      await expect(
+        page.locator("#policies-view .po-config .pill-src").first(),
+      ).toBeVisible();
     } finally {
       await gambi.stop();
       await fs.rm(configHome, { recursive: true, force: true });

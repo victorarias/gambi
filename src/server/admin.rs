@@ -841,7 +841,7 @@ async fn root() -> Html<&'static str> {
           h += '<div class="p-row">';
           h += '<div class="po-top"><span class="po-name"><span class="t-ns">' + esc(serverName) + ':</span>' + esc(toolName) + '</span><span class="po-config">';
           h += '<button type="button" class="pill pill-btn ' + levelClass + '" data-action="toggle-policy-level" data-server="' + escAttrHtml(serverName) + '" data-tool="' + escAttrHtml(toolName) + '" data-level="' + escAttrHtml(level) + '" title="toggle safe/escalated and save">' + esc(level) + '</button>';
-          h += '<button type="button" class="pill pill-btn pill-src" data-action="toggle-policy-source" data-server="' + escAttrHtml(serverName) + '" data-tool="' + escAttrHtml(toolName) + '" data-source="' + escAttrHtml(source) + '" data-level="' + escAttrHtml(level) + '" title="pin/unpin override and save">' + esc(source) + '</button>';
+          h += '<span class="pill pill-src">' + esc(source) + '</span>';
           h += '</span></div>';
           h += '<div class="po-desc">' + esc(tools[j].description || '') + '</div>';
           h += '</div>';
@@ -988,10 +988,6 @@ async fn root() -> Html<&'static str> {
       await postJson('/tool-policies', { server: server, tool: tool, level: level });
     }
 
-    async function removeToolPolicyOverride(server, tool) {
-      await postJson('/tool-policies/remove', { server: server, tool: tool });
-    }
-
     async function deletePath(path) {
       const response = await fetch(path, { method: 'DELETE' });
       if (!response.ok) {
@@ -1052,7 +1048,6 @@ async fn root() -> Html<&'static str> {
       const server = target.getAttribute('data-server') || '';
       const tool = target.getAttribute('data-tool') || '';
       const level = target.getAttribute('data-level') || '';
-      const source = target.getAttribute('data-source') || '';
       if (!server || !tool) return;
 
       target.disabled = true;
@@ -1064,17 +1059,6 @@ async fn root() -> Html<&'static str> {
             await refresh({ forceTools: true });
           });
           return;
-        }
-        if (action === 'toggle-policy-source') {
-          await runAction('toggle policy override', async function() {
-            if (source === 'override') {
-              await removeToolPolicyOverride(server, tool);
-            } else {
-              const pinnedLevel = level === 'safe' ? 'safe' : 'escalated';
-              await saveToolPolicyOverride(server, tool, pinnedLevel);
-            }
-            await refresh({ forceTools: true });
-          });
         }
       } finally {
         target.disabled = false;
