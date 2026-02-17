@@ -42,7 +42,9 @@ const HTTP_RECONNECT_MAX_ATTEMPTS: usize = 6;
 const HTTP_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(250);
 const HTTP_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(8);
 const HTTP_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5);
+const AUTH_REQUIRED_MARKER: &str = "gambi_auth_required";
 
 #[derive(Debug)]
 pub enum UpstreamRequestError {
@@ -62,6 +64,50 @@ impl fmt::Display for UpstreamRequestError {
 }
 
 impl std::error::Error for UpstreamRequestError {}
+
+#[derive(Debug)]
+pub struct UpstreamAuthFailure {
+    server_name: String,
+    status_code: Option<u16>,
+    www_authenticate: Option<String>,
+}
+
+impl UpstreamAuthFailure {
+    fn new(
+        server_name: String,
+        status_code: Option<u16>,
+        www_authenticate: Option<String>,
+    ) -> Self {
+        Self {
+            server_name,
+            status_code,
+            www_authenticate,
+        }
+    }
+}
+
+impl fmt::Display for UpstreamAuthFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{AUTH_REQUIRED_MARKER}: server='{}'", self.server_name)?;
+        if let Some(status) = self.status_code {
+            write!(f, " status={status}")?;
+        }
+        if let Some(challenge) = &self.www_authenticate {
+            write!(f, " www-authenticate={challenge:?}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UpstreamAuthFailure {}
+
+pub fn transport_error_is_auth_failure(err: &anyhow::Error) -> bool {
+    err.is::<UpstreamAuthFailure>()
+}
+
+pub fn message_has_auth_required_marker(message: &str) -> bool {
+    message.contains(AUTH_REQUIRED_MARKER)
+}
 
 fn map_service_error(err: ServiceError) -> UpstreamRequestError {
     match err {
@@ -1281,13 +1327,24 @@ async fn spawn_managed_http_client(
         .context("failed to construct reqwest client for streamable-http transport")?;
 
     let transport =
-        StreamableHttpClientTransport::with_client(http_client, transport_config.clone());
+        StreamableHttpClientTransport::with_client(http_client.clone(), transport_config.clone());
 
     let handler = UpstreamClient::default();
-    let service =
-        handler.clone().serve(transport).await.with_context(|| {
-            format!("failed to initialize MCP HTTP client for '{}'", server.name)
-        })?;
+    let service = match handler.clone().serve(transport).await {
+        Ok(service) => service,
+        Err(err) => {
+            if let Some(auth_failure) =
+                probe_http_auth_failure(server, target, &http_client, auth_header).await
+            {
+                return Err(anyhow!(auth_failure)).with_context(|| {
+                    format!("failed to initialize MCP HTTP client for '{}'", server.name)
+                });
+            }
+            return Err(err).with_context(|| {
+                format!("failed to initialize MCP HTTP client for '{}'", server.name)
+            });
+        }
+    };
 
     let peer = service.peer().clone();
 
@@ -1463,6 +1520,73 @@ fn duration_env_ms(key: &str, fallback: Duration) -> Duration {
         .unwrap_or(fallback)
 }
 
+async fn probe_http_auth_failure(
+    server: &ServerConfig,
+    target: &HttpServerTarget,
+    http_client: &reqwest::Client,
+    auth_header: Option<&str>,
+) -> Option<UpstreamAuthFailure> {
+    let mut request = http_client
+        .get(&target.uri)
+        .timeout(HTTP_AUTH_PROBE_TIMEOUT)
+        .header(
+            "accept",
+            "application/json, text/event-stream;q=0.9, */*;q=0.1",
+        );
+
+    if let Some(token) = auth_header.map(str::trim).filter(|value| !value.is_empty()) {
+        let authorization = if token.to_ascii_lowercase().starts_with("bearer ") {
+            token.to_string()
+        } else {
+            format!("Bearer {token}")
+        };
+        request = request.header("authorization", authorization);
+    }
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            debug!(
+                server = %server.name,
+                uri = %target.uri,
+                error = %err,
+                "http auth probe request failed"
+            );
+            return None;
+        }
+    };
+
+    let status = response.status().as_u16();
+    let challenge = response
+        .headers()
+        .get("www-authenticate")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    let challenge_implies_auth = challenge
+        .as_deref()
+        .map(|value| {
+            let lower = value.to_ascii_lowercase();
+            lower.contains("bearer")
+                || lower.contains("invalid_token")
+                || lower.contains("insufficient_scope")
+                || lower.contains("error=")
+        })
+        .unwrap_or(false);
+
+    let status_implies_auth = status == 401 || status == 403;
+
+    if !status_implies_auth && !challenge_implies_auth {
+        return None;
+    }
+
+    Some(UpstreamAuthFailure::new(
+        server.name.clone(),
+        Some(status),
+        challenge,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1471,12 +1595,14 @@ mod tests {
         auth::{OAuthToken, TokenState},
         config::ServerConfig,
     };
+    use anyhow::anyhow;
     use rmcp::transport::common::client_side_sse::SseRetryPolicy;
 
     use super::{
         BoundedExponentialBackoff, DISCOVERY_CACHE_TTL, DiscoveryCacheEntry, DiscoveryFailure,
-        DiscoveryResult, UpstreamManager, UpstreamTransportTarget, auth_headers_from_token_state,
-        parse_stdio_target, parse_upstream_target,
+        DiscoveryResult, UpstreamAuthFailure, UpstreamManager, UpstreamTransportTarget,
+        auth_headers_from_token_state, message_has_auth_required_marker, parse_stdio_target,
+        parse_upstream_target, transport_error_is_auth_failure,
     };
 
     #[test]
@@ -1599,6 +1725,17 @@ mod tests {
             None,
             "retry should stop when max is reached"
         );
+    }
+
+    #[test]
+    fn auth_failure_marker_helpers_roundtrip() {
+        let err = anyhow!(UpstreamAuthFailure::new(
+            "port".to_string(),
+            Some(401),
+            Some("Bearer realm=\"OAuth\"".to_string())
+        ));
+        assert!(transport_error_is_auth_failure(&err));
+        assert!(message_has_auth_required_marker(&err.to_string()));
     }
 
     #[tokio::test]

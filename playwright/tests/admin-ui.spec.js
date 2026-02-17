@@ -360,4 +360,69 @@ test.describe("admin UI", () => {
       await fs.rm(configHome, { recursive: true, force: true });
     }
   });
+
+  test("supports click-to-save policy pills", async ({ page }) => {
+    const binPath = resolveGambiBin();
+    if (!(await ensurePathExists(binPath))) {
+      throw new Error(
+        `gambi binary not found at ${binPath}; run 'cargo build --bin gambi' first`,
+      );
+    }
+
+    const configHome = await fs.mkdtemp(
+      path.join(os.tmpdir(), "gambi-admin-ui-policy-pill-clicks-"),
+    );
+    const gambi = await startGambi({ binPath, configHome, execEnabled: false });
+    try {
+      await page.goto(gambi.baseUrl, { waitUntil: "domcontentloaded" });
+      await expect(page.getByRole("heading", { name: "gambi admin" })).toBeVisible();
+
+      await page.fill("#server-name", "fixture");
+      await page.fill("#server-url", gambi.fixtureServerUrl);
+      await page.locator("#server-add-form button[type=submit]").click();
+
+      const levelPill = page.locator(
+        '#policies-view button[data-action="toggle-policy-level"][data-server="fixture"][data-tool="fixture_echo"]',
+      );
+      const sourcePill = page.locator(
+        '#policies-view button[data-action="toggle-policy-source"][data-server="fixture"][data-tool="fixture_echo"]',
+      );
+
+      await expect(levelPill).toBeVisible();
+      await expect(sourcePill).toBeVisible();
+
+      const initialLevel = ((await levelPill.textContent()) || "").trim();
+      expect(["safe", "escalated"]).toContain(initialLevel);
+      const toggledLevel = initialLevel === "safe" ? "escalated" : "safe";
+
+      await levelPill.click();
+
+      await expect
+        .poll(async () => {
+          const policies = await readJsonPre(page, "policies");
+          if (!policies || !policies.tool_policy_overrides) return null;
+          const byServer = policies.tool_policy_overrides.fixture || {};
+          return byServer.fixture_echo || null;
+        })
+        .toBe(toggledLevel);
+
+      await expect(sourcePill).toHaveText("override");
+
+      await sourcePill.click();
+
+      await expect
+        .poll(async () => {
+          const policies = await readJsonPre(page, "policies");
+          if (!policies || !policies.tool_policy_overrides) return "__missing__";
+          const byServer = policies.tool_policy_overrides.fixture || {};
+          return byServer.fixture_echo || "__missing__";
+        })
+        .toBe("__missing__");
+
+      await expect(sourcePill).toHaveText("heuristic");
+    } finally {
+      await gambi.stop();
+      await fs.rm(configHome, { recursive: true, force: true });
+    }
+  });
 });

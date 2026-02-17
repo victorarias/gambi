@@ -432,7 +432,8 @@ fn looks_like_auth_failure_error(err: &UpstreamRequestError) -> bool {
             looks_like_auth_failure_message(protocol.message.as_ref())
         }
         UpstreamRequestError::Transport(transport) => {
-            looks_like_auth_failure_message(&transport.to_string())
+            crate::upstream::transport_error_is_auth_failure(transport)
+                || looks_like_auth_failure_message(&transport.to_string())
         }
         UpstreamRequestError::Cancelled => false,
     }
@@ -440,13 +441,18 @@ fn looks_like_auth_failure_error(err: &UpstreamRequestError) -> bool {
 
 fn looks_like_auth_failure_message(message: &str) -> bool {
     let msg = message.trim().to_ascii_lowercase();
-    msg.contains("invalid_token")
+    let initialize_decode_auth_failure = msg.contains("send initialize request")
+        && (msg.contains("error decoding response body")
+            || msg.contains("unexpected content type"));
+    crate::upstream::message_has_auth_required_marker(message)
+        || msg.contains("invalid_token")
         || msg.contains("invalid token")
         || msg.contains("auth required")
         || msg.contains("unauthorized")
         || msg.contains("forbidden")
         || msg.contains("401")
         || msg.contains("403")
+        || initialize_decode_auth_failure
 }
 
 fn map_execution_error(err: ExecutionError) -> McpError {
@@ -1069,6 +1075,12 @@ return fixture.fixture_echo(value=2)
         assert!(looks_like_auth_failure_message("Auth required"));
         assert!(looks_like_auth_failure_message("401 unauthorized"));
         assert!(looks_like_auth_failure_message("403 forbidden"));
+        assert!(looks_like_auth_failure_message(
+            "gambi_auth_required: server='port' status=401"
+        ));
+        assert!(looks_like_auth_failure_message(
+            "Client error: error decoding response body, when send initialize request"
+        ));
         assert!(!looks_like_auth_failure_message("connection reset by peer"));
     }
 

@@ -421,6 +421,10 @@ async fn root() -> Html<&'static str> {
     .po-config { display: flex; gap: 6px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
     .po-desc { color: var(--text-3); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
     .pill { border: 1px solid var(--border); border-radius: 100px; padding: 1px 8px; font-size: 10px; color: var(--text-2); justify-self: start; }
+    .pill-btn { font-family: var(--mono); background: transparent; cursor: pointer; transition: border-color 0.15s, opacity 0.15s, transform 0.08s; }
+    .pill-btn:hover { border-color: var(--border-hi); }
+    .pill-btn:active { transform: scale(0.98); }
+    .pill-btn:disabled { opacity: 0.5; cursor: wait; transform: none; }
     .pill-safe { border-color: rgba(74,222,128,0.35); color: var(--green); background: rgba(74,222,128,0.08); }
     .pill-esc { border-color: rgba(248,113,113,0.35); color: var(--red); background: rgba(248,113,113,0.08); }
     .pill-src { color: var(--text-3); }
@@ -835,7 +839,10 @@ async fn root() -> Html<&'static str> {
           const levelClass = level === 'safe' ? 'pill-safe' : 'pill-esc';
           const toolName = tools[j].upstream_name || tools[j].name || '';
           h += '<div class="p-row">';
-          h += '<div class="po-top"><span class="po-name"><span class="t-ns">' + esc(serverName) + ':</span>' + esc(toolName) + '</span><span class="po-config"><span class="pill ' + levelClass + '">' + esc(level) + '</span><span class="pill pill-src">' + esc(source) + '</span></span></div>';
+          h += '<div class="po-top"><span class="po-name"><span class="t-ns">' + esc(serverName) + ':</span>' + esc(toolName) + '</span><span class="po-config">';
+          h += '<button type="button" class="pill pill-btn ' + levelClass + '" data-action="toggle-policy-level" data-server="' + escAttrHtml(serverName) + '" data-tool="' + escAttrHtml(toolName) + '" data-level="' + escAttrHtml(level) + '" title="toggle safe/escalated and save">' + esc(level) + '</button>';
+          h += '<button type="button" class="pill pill-btn pill-src" data-action="toggle-policy-source" data-server="' + escAttrHtml(serverName) + '" data-tool="' + escAttrHtml(toolName) + '" data-source="' + escAttrHtml(source) + '" data-level="' + escAttrHtml(level) + '" title="pin/unpin override and save">' + esc(source) + '</button>';
+          h += '</span></div>';
           h += '<div class="po-desc">' + esc(tools[j].description || '') + '</div>';
           h += '</div>';
         }
@@ -977,6 +984,14 @@ async fn root() -> Html<&'static str> {
       }
     }
 
+    async function saveToolPolicyOverride(server, tool, level) {
+      await postJson('/tool-policies', { server: server, tool: tool, level: level });
+    }
+
+    async function removeToolPolicyOverride(server, tool) {
+      await postJson('/tool-policies/remove', { server: server, tool: tool });
+    }
+
     async function deletePath(path) {
       const response = await fetch(path, { method: 'DELETE' });
       if (!response.ok) {
@@ -1024,6 +1039,46 @@ async fn root() -> Html<&'static str> {
 
     document.getElementById('policy-server-mode-name').addEventListener('change', function() {
       syncSelectedServerPolicyMode();
+    });
+
+    document.getElementById('policies-view').addEventListener('click', async function(event) {
+      const rawTarget = event.target;
+      if (!(rawTarget instanceof Element)) return;
+      const target = rawTarget.closest('button[data-action]');
+      if (!target) return;
+      event.preventDefault();
+
+      const action = target.getAttribute('data-action');
+      const server = target.getAttribute('data-server') || '';
+      const tool = target.getAttribute('data-tool') || '';
+      const level = target.getAttribute('data-level') || '';
+      const source = target.getAttribute('data-source') || '';
+      if (!server || !tool) return;
+
+      target.disabled = true;
+      try {
+        if (action === 'toggle-policy-level') {
+          const nextLevel = level === 'safe' ? 'escalated' : 'safe';
+          await runAction('save policy override', async function() {
+            await saveToolPolicyOverride(server, tool, nextLevel);
+            await refresh({ forceTools: true });
+          });
+          return;
+        }
+        if (action === 'toggle-policy-source') {
+          await runAction('toggle policy override', async function() {
+            if (source === 'override') {
+              await removeToolPolicyOverride(server, tool);
+            } else {
+              const pinnedLevel = level === 'safe' ? 'safe' : 'escalated';
+              await saveToolPolicyOverride(server, tool, pinnedLevel);
+            }
+            await refresh({ forceTools: true });
+          });
+        }
+      } finally {
+        target.disabled = false;
+      }
     });
 
     document.getElementById('server-policy-mode-form').addEventListener('submit', async function(event) {
@@ -1392,10 +1447,11 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
     // If an HTTP upstream says "auth required" and we don't have a client_id yet, attempt
     // MCP-spec OAuth discovery + RFC 7591 dynamic client registration in the background.
     for failure in &discovery.failures {
-        if !looks_like_auth_required(&failure.message) {
+        if !looks_like_auth_failure(&failure.message) {
             continue;
         }
-        let should_try_refresh = looks_like_invalid_token(&failure.message);
+        let should_try_refresh = looks_like_invalid_token(&failure.message)
+            || looks_like_initialize_decode_auth_failure(&failure.message);
         let is_http = cfg
             .servers
             .iter()
@@ -1586,11 +1642,24 @@ fn looks_like_auth_required(message: &str) -> bool {
         || msg.contains("403")
 }
 
+fn looks_like_initialize_decode_auth_failure(message: &str) -> bool {
+    let msg = message.trim().to_ascii_lowercase();
+    msg.contains("send initialize request")
+        && (msg.contains("error decoding response body") || msg.contains("unexpected content type"))
+}
+
 fn looks_like_invalid_token(message: &str) -> bool {
     message
         .trim()
         .to_ascii_lowercase()
         .contains("invalid_token")
+}
+
+fn looks_like_auth_failure(message: &str) -> bool {
+    crate::upstream::message_has_auth_required_marker(message)
+        || looks_like_auth_required(message)
+        || looks_like_invalid_token(message)
+        || looks_like_initialize_decode_auth_failure(message)
 }
 
 async fn logs(Query(query): Query<LogsQuery>) -> Result<Json<LogsResponse>, ApiError> {

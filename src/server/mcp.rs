@@ -1383,6 +1383,14 @@ async fn discover_resources_with_auto_refresh(
 }
 
 async fn refresh_auth_for_server(store: &ConfigStore, server_name: &str) -> Result<bool> {
+    let tokens: TokenState = store.load_tokens_async().await?;
+    let Some(token) = tokens.oauth_tokens.get(server_name) else {
+        return Ok(false);
+    };
+    if token.refresh_token.is_none() {
+        return Ok(false);
+    }
+
     let auth = crate::auth::AuthManager::new(store.clone());
     match auth.refresh(server_name).await {
         Ok(response) => {
@@ -1421,7 +1429,8 @@ fn looks_like_auth_failure_error(err: &upstream::UpstreamRequestError) -> bool {
             looks_like_auth_failure(protocol.message.as_ref())
         }
         upstream::UpstreamRequestError::Transport(transport) => {
-            looks_like_auth_failure(&transport.to_string())
+            upstream::transport_error_is_auth_failure(transport)
+                || looks_like_auth_failure(&transport.to_string())
         }
         upstream::UpstreamRequestError::Cancelled => false,
     }
@@ -1441,8 +1450,17 @@ fn looks_like_auth_required(message: &str) -> bool {
         || msg.contains("403")
 }
 
+fn looks_like_initialize_decode_auth_failure(message: &str) -> bool {
+    let msg = message.trim().to_ascii_lowercase();
+    msg.contains("send initialize request")
+        && (msg.contains("error decoding response body") || msg.contains("unexpected content type"))
+}
+
 fn looks_like_auth_failure(message: &str) -> bool {
-    looks_like_invalid_token(message) || looks_like_auth_required(message)
+    upstream::message_has_auth_required_marker(message)
+        || looks_like_invalid_token(message)
+        || looks_like_auth_required(message)
+        || looks_like_initialize_decode_auth_failure(message)
 }
 
 #[cfg(test)]
@@ -1506,6 +1524,12 @@ mod tests {
             "upstream returned 401 unauthorized"
         ));
         assert!(looks_like_auth_failure("http 403 forbidden"));
+        assert!(looks_like_auth_failure(
+            "gambi_auth_required: server='port' status=401"
+        ));
+        assert!(looks_like_auth_failure(
+            "Client error: error decoding response body, when send initialize request"
+        ));
         assert!(!looks_like_auth_failure("connection reset by peer"));
     }
 
