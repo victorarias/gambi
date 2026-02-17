@@ -1237,7 +1237,38 @@ async fn spawn_managed_client(
     match target {
         UpstreamTransportTarget::Stdio(target) => spawn_managed_stdio_client(server, &target).await,
         UpstreamTransportTarget::Http(target) => {
-            spawn_managed_http_client(server, &target, auth_header).await
+            match spawn_managed_http_client(server, &target, auth_header).await {
+                Ok(client) => Ok(client),
+                Err(http_err)
+                    if server.transport == TransportMode::Auto
+                        && looks_like_http_transport_decode_error(&http_err) =>
+                {
+                    warn!(
+                        server = %server.name,
+                        uri = %target.uri,
+                        error = %http_err,
+                        "streamable-http transport initialization failed in auto mode with decode/protocol error; retrying with legacy-sse"
+                    );
+                    let sse_target = SseServerTarget {
+                        uri: target.uri.clone(),
+                    };
+                    match spawn_managed_sse_client(server, &sse_target, auth_header).await {
+                        Ok(client) => {
+                            warn!(
+                                server = %server.name,
+                                uri = %target.uri,
+                                "auto transport fallback to legacy-sse succeeded"
+                            );
+                            Ok(client)
+                        }
+                        Err(sse_err) => Err(anyhow!(
+                            "auto transport failed for '{}': streamable-http error: {http_err:#}; legacy-sse fallback error: {sse_err:#}",
+                            server.name
+                        )),
+                    }
+                }
+                Err(http_err) => Err(http_err),
+            }
         }
         UpstreamTransportTarget::Sse(target) => {
             match spawn_managed_sse_client(server, &target, auth_header).await {
@@ -1271,6 +1302,13 @@ async fn spawn_managed_client(
             }
         }
     }
+}
+
+fn looks_like_http_transport_decode_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("error decoding response body")
+        || msg.contains("unexpected content type")
+        || msg.contains("data did not match any variant of untagged enum jsonrpcmessage")
 }
 
 async fn spawn_managed_stdio_client(

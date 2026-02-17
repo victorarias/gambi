@@ -780,16 +780,16 @@ async fn root() -> Html<&'static str> {
       if (!auth || !auth.oauth_configured) {
         return { dot: 'dot-off', text: 'not configured', action: '' };
       }
+      if (!auth.has_token) {
+        return { dot: 'dot-off', text: 'no token', action: 'login' };
+      }
       if (auth.last_error) {
         return { dot: 'dot-err', text: auth.last_error, action: 'refresh' };
       }
       if (auth.degraded) {
         return { dot: 'dot-warn', text: 'degraded', action: 'refresh' };
       }
-      if (auth.has_token) {
-        return { dot: 'dot-ok', text: 'authenticated', action: '' };
-      }
-      return { dot: 'dot-off', text: 'no token', action: 'login' };
+      return { dot: 'dot-ok', text: 'authenticated', action: '' };
     }
 
     function renderStatusStrip() {

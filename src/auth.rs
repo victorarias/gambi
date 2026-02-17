@@ -7,6 +7,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{Rng, distributions::Alphanumeric};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -393,6 +394,16 @@ impl AuthManager {
                 Ok(response)
             }
             Err(err) => {
+                if refresh_error_requires_relogin(&err.to_string()) {
+                    let server_name = server_name.to_string();
+                    let _ = self
+                        .store
+                        .update_tokens_async::<TokenState, _, _>(move |tokens| {
+                            tokens.oauth_tokens.remove(&server_name);
+                            Ok(())
+                        })
+                        .await;
+                }
                 let _ = self
                     .mark_server_degraded(server_name, err.to_string(), None)
                     .await;
@@ -546,12 +557,39 @@ impl AuthManager {
             ])
             .send()
             .await
-            .context("oauth refresh request failed")?
-            .error_for_status()
-            .context("oauth refresh returned error response")?
-            .json::<OAuthTokenExchangeResponse>()
-            .await
-            .context("oauth refresh response JSON is invalid")?;
+            .context("oauth refresh request failed")?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if refresh_error_requires_relogin(&body) {
+                bail!(
+                    "oauth refresh returned error response ({status_code}): login required ({body})"
+                );
+            }
+            bail!("oauth refresh returned error response ({status_code})");
+        }
+        let payload: Value =
+            serde_json::from_str(&body).context("oauth refresh response JSON is invalid")?;
+        if let Some(error_code) = payload.get("error").and_then(Value::as_str) {
+            let error_description = payload
+                .get("error_description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let details = if error_description.trim().is_empty() {
+                error_code.to_string()
+            } else {
+                format!("{error_code}: {error_description}")
+            };
+            if refresh_error_requires_relogin(&details) {
+                bail!(
+                    "oauth refresh returned error response ({status_code}): login required ({details})"
+                );
+            }
+            bail!("oauth refresh returned error response ({status_code}): {details}");
+        }
+        let response: OAuthTokenExchangeResponse =
+            serde_json::from_value(payload).context("oauth refresh response JSON is invalid")?;
 
         let mut updated = build_token(response, &resolved.scopes);
         if updated.refresh_token.is_none() {
@@ -960,6 +998,15 @@ fn set_server_healthy(tokens: &mut TokenState, server_name: &str) {
     state.next_retry_after_epoch_seconds = None;
 }
 
+fn refresh_error_requires_relogin(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("invalid_grant")
+        || lower.contains("token is expired")
+        || lower.contains("token has invalid")
+        || lower.contains("invalid token")
+        || lower.contains("login required")
+}
+
 pub fn prune_token_state_for_server_names(
     tokens: &mut TokenState,
     server_names: &HashSet<String>,
@@ -1141,6 +1188,64 @@ mod tests {
                 .unwrap_or_default()
                 .contains("no oauth token found")
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_invalid_grant_clears_token_and_marks_login_required() {
+        let (token_url, handle) = spawn_token_server().await;
+        let oauth = OAuthConfig {
+            discovery_url: None,
+            authorize_url: "https://example.com/oauth/authorize".to_string(),
+            token_url,
+            client_id: Some("client-id".to_string()),
+            scopes: vec!["read".to_string()],
+        };
+        let (_temp, store) = configured_store(Some(oauth));
+
+        store
+            .update_tokens::<TokenState, _, _>(|tokens| {
+                tokens.oauth_tokens.insert(
+                    "port".to_string(),
+                    OAuthToken {
+                        access_token: "expired-token".to_string(),
+                        refresh_token: Some("bad-refresh-token".to_string()),
+                        token_type: Some("Bearer".to_string()),
+                        expires_at_epoch_seconds: Some(
+                            super::now_epoch_seconds().saturating_sub(30),
+                        ),
+                        scopes: vec!["read".to_string()],
+                    },
+                );
+                Ok(())
+            })
+            .expect("seed token state");
+
+        let manager = AuthManager::new(store.clone());
+        let err = manager
+            .refresh("port")
+            .await
+            .expect_err("refresh should fail for invalid grant");
+        assert!(err.to_string().contains("login required"));
+
+        let tokens: TokenState = store.load_tokens().expect("token state should load");
+        assert!(
+            !tokens.oauth_tokens.contains_key("port"),
+            "invalid grant should clear stale token for relogin"
+        );
+
+        let statuses = manager.list_statuses().await.expect("status should load");
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].has_token);
+        assert!(statuses[0].degraded);
+        assert!(
+            statuses[0]
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("login required")
+        );
+
+        handle.abort();
     }
 
     #[tokio::test]
