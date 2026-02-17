@@ -168,6 +168,14 @@ impl ExposureMode {
     }
 }
 
+fn default_server_enabled() -> bool {
+    true
+}
+
+fn is_server_enabled(value: &bool) -> bool {
+    *value
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolPolicyMode {
@@ -246,6 +254,11 @@ pub struct ServerConfig {
     pub transport: TransportMode,
     #[serde(default, skip_serializing_if = "ExposureMode::is_passthrough")]
     pub exposure_mode: ExposureMode,
+    #[serde(
+        default = "default_server_enabled",
+        skip_serializing_if = "is_server_enabled"
+    )]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -290,6 +303,7 @@ impl AppConfig {
             oauth: server.oauth,
             transport: server.transport,
             exposure_mode: server.exposure_mode,
+            enabled: server.enabled,
         });
         self.servers.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(())
@@ -321,6 +335,26 @@ impl AppConfig {
         };
         server.exposure_mode = exposure_mode;
         Ok(())
+    }
+
+    pub fn set_server_enabled(&mut self, server_name: &str, enabled: bool) -> Result<()> {
+        let Some(server) = self
+            .servers
+            .iter_mut()
+            .find(|server| server.name == server_name)
+        else {
+            bail!("unknown server '{server_name}'");
+        };
+        server.enabled = enabled;
+        Ok(())
+    }
+
+    pub fn enabled_servers(&self) -> Vec<ServerConfig> {
+        self.servers
+            .iter()
+            .filter(|server| server.enabled)
+            .cloned()
+            .collect()
     }
 
     pub fn set_tool_description_override(
@@ -1222,6 +1256,7 @@ mod tests {
                     oauth: None,
                     transport: Default::default(),
                     exposure_mode: Default::default(),
+                    enabled: true,
                 })
             })
             .expect("add server");
@@ -1248,6 +1283,7 @@ mod tests {
             oauth: None,
             transport: Default::default(),
             exposure_mode: Default::default(),
+            enabled: true,
         })
         .expect("first add should succeed");
 
@@ -1258,6 +1294,7 @@ mod tests {
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             })
             .expect_err("duplicate add should fail");
 
@@ -1275,6 +1312,7 @@ mod tests {
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             })
             .expect_err("name with colon should fail");
         assert!(with_colon.to_string().contains("cannot contain ':'"));
@@ -1286,6 +1324,7 @@ mod tests {
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             })
             .expect_err("name with whitespace should fail");
         assert!(with_space.to_string().contains("whitespace"));
@@ -1302,6 +1341,7 @@ mod tests {
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             })
             .expect_err("bad scheme should fail");
         assert!(
@@ -1317,6 +1357,7 @@ mod tests {
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             })
             .expect_err("empty stdio command should fail");
         assert!(
@@ -1331,6 +1372,7 @@ mod tests {
             oauth: None,
             transport: Default::default(),
             exposure_mode: Default::default(),
+            enabled: true,
         })
         .expect("stdio transport should be allowed");
     }
@@ -1344,6 +1386,7 @@ mod tests {
             oauth: None,
             transport: Default::default(),
             exposure_mode: Default::default(),
+            enabled: true,
         })
         .expect("valid server should be added");
 
@@ -1371,6 +1414,7 @@ mod tests {
             oauth: None,
             transport: Default::default(),
             exposure_mode: Default::default(),
+            enabled: true,
         })
         .expect("valid server should be added");
 
@@ -1422,6 +1466,7 @@ mod tests {
             oauth: None,
             transport: Default::default(),
             exposure_mode: Default::default(),
+            enabled: true,
         })
         .expect("valid server should be added");
 
@@ -1459,6 +1504,7 @@ mod tests {
                 }),
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             })
             .expect_err("invalid oauth discovery URL must fail");
         assert!(bad_discovery.to_string().contains("oauth discovery_url"));
@@ -1476,6 +1522,7 @@ mod tests {
                 }),
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             })
             .expect_err("invalid oauth config must fail");
         assert!(bad.to_string().contains("invalid oauth authorize_url"));
@@ -1494,6 +1541,7 @@ mod tests {
             }),
             transport: Default::default(),
             exposure_mode: Default::default(),
+            enabled: true,
         })
         .expect("valid oauth config should succeed");
     }
@@ -1530,6 +1578,7 @@ mod tests {
             oauth: None,
             transport: Default::default(),
             exposure_mode: Default::default(),
+            enabled: true,
         })
         .expect("valid config");
 
@@ -1544,6 +1593,7 @@ mod tests {
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             }],
             server_tool_policy_modes: BTreeMap::new(),
             tool_description_overrides: BTreeMap::new(),
@@ -1571,6 +1621,7 @@ mod tests {
                         oauth: None,
                         transport: Default::default(),
                         exposure_mode: Default::default(),
+                        enabled: true,
                     })
                 })
             }));
@@ -1621,6 +1672,7 @@ mod tests {
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             }],
             server_tool_policy_modes: BTreeMap::new(),
             tool_description_overrides: BTreeMap::new(),

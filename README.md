@@ -21,12 +21,14 @@ That kind of duct-tape-and-ingenuity solution has a name in Brazilian Portuguese
 - **Single MCP connection** — your agent talks to one stdio server and sees all upstream tools, namespaced (`github:search_issues`, `slack:post_message`)
 - **Aggregation** — tools, prompts, and resources from every upstream server, with automatic namespacing and routing
 - **`gambi_execute` + `gambi_execute_escalated`** — safe-first execution with explicit escalation when workflows need higher-risk tools
-- **Admin UI** — web dashboard to add/remove servers, view tools, manage OAuth, override tool descriptions, and tail logs
-- **Execution policy controls** — classify each catalog as `heuristic`, `all-safe`, `all-escalated`, or `custom`, with per-tool overrides
+- **Admin UI** — web dashboard with three tabs (Servers, Tools, Logs) plus a status strip of per-server health chips; add/remove servers, activate/deactivate them, change exposure and policy via inline selectors, edit tool descriptions, and monitor logs
+- **Activation controls** — deactivate a server without deleting config; reactivate with one click
+- **Exposure modes** — control how much tool metadata your agent sees: `passthrough`, `compact`, `names-only`, or `server-only`
+- **Execution policy controls** — classify each server catalog as `heuristic`, `all-safe`, `all-escalated`, or `custom`; each tool shows a `safe`/`escalated` badge and a policy-source pill (`heuristic`, `override`, `system`)
 - **OAuth handling** — PKCE, token refresh/rotation, degraded-state reporting — all managed for you
-- **Tool description overrides** — rewrite what your agent sees for any upstream tool, useful when upstream descriptions are unhelpful
+- **Tool description overrides** — click any tool description to edit it inline; save or cancel, compare diffs, or restore the original
 
-![gambi admin with servers configured](docs/screenshots/admin-overrides.png)
+![gambi admin tools tab](docs/screenshots/admin-overrides.png)
 
 ## Install
 
@@ -73,6 +75,8 @@ Via CLI:
 ```bash
 gambi add github https://github.com/github/github-mcp-server
 gambi add my-tool 'stdio:///usr/local/bin/my-mcp?arg=--stdio'
+gambi disable github
+gambi enable github
 gambi list
 gambi remove github
 ```
@@ -136,17 +140,26 @@ slack.post_message(channel="eng", text=f"Issue loaded: {result['id']}")
 
 ## Admin UI
 
-The admin panel runs on loopback only and gives you:
+The admin panel runs on loopback only (`http://127.0.0.1:3333`) and is organized into three tabs:
 
-- **Status** — health, exec status, server count, discovery failures
-- **Servers** — add/remove upstream MCP servers
-- **Tools** — see every tool your agent can access, with descriptions
-- **Policy** — catalog mode (`heuristic`, `all-safe`, `all-escalated`, `custom`) + per-tool policy overrides
-- **Overrides** — rewrite tool descriptions to help your agent understand what a tool does
-- **Auth** — OAuth status per server, start/refresh flows
-- **Logs** — tail recent server activity
+**Header** — status badges (ok/error, exec on/off, server count, failure count) always visible at the top.
 
-Every panel has a "json" toggle to see the raw API response.
+**Status strip** — a row of per-server chips showing connection state at a glance (authenticated, disabled, degraded, not configured). Login/refresh buttons appear inline when a server needs attention.
+
+**Servers tab** — add servers by name + URL with exposure and policy selectors. Each server card shows:
+- Inline dropdowns to change exposure mode (`passthrough`, `compact`, `names-only`, `server-only`) and policy mode (`heuristic`, `all-safe`, `all-escalated`, `custom`)
+- Activate / Deactivate toggle to enable or disable a server without removing it
+- Remove button (requires double-click confirmation)
+- Auth status chip and a summary line (`state=enabled · exposure=passthrough · policy=heuristic`)
+
+**Tools tab** — lists every tool your agent can access, with filters by name/description, server, and policy level. Each tool row shows:
+- `safe` / `escalated` routing badges you can click to override the policy for that tool
+- A policy-source pill (`heuristic`, `override`, `catalog`, `system`) showing where the classification comes from
+- Click-to-edit description: click the description text to open an inline editor with Save Override / Cancel buttons; when an override exists, a diff view and Restore button are available
+
+**Logs tab** — tails recent server activity.
+
+Every tab has a "json" toggle to see the raw API response.
 
 API endpoints are also available directly: `/health`, `/status`, `/servers`, `/tools`, `/logs`, `/auth/status`, `/config/export`, `/config/import`, and more.
 
@@ -158,6 +171,8 @@ gambi serve --admin-port 4000      # custom admin port
 gambi serve --no-exec              # disable both execution tools
 gambi add <name> <url>             # add upstream server
 gambi add <name> <url> --policy all-escalated
+gambi disable <name>               # deactivate server (keep config and auth state)
+gambi enable <name>                # reactivate server
 gambi remove <name>                # remove upstream server
 gambi policy <name> custom         # set catalog policy mode
 gambi list                         # list configured servers

@@ -25,6 +25,8 @@ enum Commands {
     Serve(ServeArgs),
     Stop(StopArgs),
     Add(AddArgs),
+    Enable(ServerToggleArgs),
+    Disable(ServerToggleArgs),
     Exposure(ExposureArgs),
     Policy(PolicyArgs),
     List,
@@ -83,6 +85,12 @@ struct PolicyArgs {
     name: String,
     /// Policy mode: heuristic|all-safe|all-escalated|custom.
     policy: String,
+}
+
+#[derive(Debug, Args)]
+struct ServerToggleArgs {
+    /// Configured server name.
+    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -203,6 +211,7 @@ mod tests {
                     oauth: None,
                     transport: Default::default(),
                     exposure_mode: Default::default(),
+                    enabled: true,
                 }],
                 server_tool_policy_modes: std::collections::BTreeMap::new(),
                 tool_description_overrides: std::collections::BTreeMap::new(),
@@ -295,10 +304,23 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
                     oauth: None,
                     transport,
                     exposure_mode,
+                    enabled: true,
                 })?;
                 cfg.set_server_tool_policy_mode(&server_name, policy_mode)
             })?;
             println!("server added");
+            Ok(())
+        }
+        Commands::Enable(args) => {
+            let server_name = args.name.clone();
+            store.update(move |cfg| cfg.set_server_enabled(&server_name, true))?;
+            println!("server enabled");
+            Ok(())
+        }
+        Commands::Disable(args) => {
+            let server_name = args.name.clone();
+            store.update(move |cfg| cfg.set_server_enabled(&server_name, false))?;
+            println!("server disabled");
             Ok(())
         }
         Commands::Exposure(args) => {
@@ -325,11 +347,16 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
             for server in &cfg.servers {
                 let policy = cfg.server_tool_policy_mode_for(&server.name);
                 println!(
-                    "{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}",
                     server.name,
                     server.url,
                     server.exposure_mode.as_str(),
-                    policy.as_str()
+                    policy.as_str(),
+                    if server.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
                 );
             }
             Ok(())

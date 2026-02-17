@@ -104,6 +104,8 @@ struct ToolDetail {
     name: String,
     description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    original_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     upstream_name: Option<String>,
@@ -168,6 +170,15 @@ struct UpdateServerToolPolicyRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct UpdateServerEnabledRequest {
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
 struct AddServerRequest {
     name: String,
     url: String,
@@ -179,6 +190,8 @@ struct AddServerRequest {
     exposure_mode: crate::config::ExposureMode,
     #[serde(default)]
     policy_mode: crate::config::ToolPolicyMode,
+    #[serde(default = "default_true")]
+    enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -287,6 +300,7 @@ pub async fn run(
         .route("/servers", get(servers).post(add_server))
         .route("/servers/{name}/exposure", post(update_server_exposure))
         .route("/servers/{name}/policy", post(update_server_tool_policy))
+        .route("/servers/{name}/enabled", post(update_server_enabled))
         .route("/servers/{name}", delete(remove_server))
         .route("/tools", get(tools))
         .route("/tool-descriptions", post(set_tool_description_override))
@@ -360,121 +374,156 @@ async fn root() -> Html<&'static str> {
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
-      --bg: #0c0c0e; --surface: #141418; --raised: #1c1c22;
-      --border: #232330; --border-hi: #333342;
-      --text: #e4e2df; --text-2: #9594a0; --text-3: #5c5c6a;
-      --accent: #e8a642; --accent-bg: rgba(232,166,66,0.08);
-      --green: #4ade80; --red: #f87171; --red-bg: rgba(248,113,113,0.08);
-      --mono: ui-monospace, 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace;
-      --sans: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-      --r: 8px; --r-sm: 5px;
+      --bg: #0d0e0f; --surface: #151617; --raised: #1d1e20;
+      --border: #28292c; --border-hi: #38393d;
+      --text: #d8d6d2; --text-2: #8a8b8e; --text-3: #555659;
+      --accent: #d4943a; --accent-bg: rgba(212,148,58,0.08);
+      --green: #7abf8a; --red: #d46a6a; --red-bg: rgba(212,106,106,0.09);
+      --mono: 'JetBrains Mono', 'Cascadia Code', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+      --sans: 'Avenir Next', 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      --r: 6px; --r-sm: 4px;
     }
-    body { font-family: var(--sans); background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5; min-height: 100vh; }
-
-    header { padding: 0 24px; height: 52px; display: flex; align-items: center; justify-content: space-between; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
-    header::after { content: ''; position: absolute; bottom: -1px; left: 0; width: 120px; height: 1px; background: linear-gradient(90deg, var(--accent), transparent); }
-    h1 { font-family: var(--mono); font-size: 15px; font-weight: 700; color: var(--accent); letter-spacing: -0.02em; }
+    body {
+      font-family: var(--sans);
+      background:
+        repeating-linear-gradient(0deg, transparent, transparent 23px, rgba(255,255,255,0.012) 23px, rgba(255,255,255,0.012) 24px),
+        repeating-linear-gradient(90deg, transparent, transparent 23px, rgba(255,255,255,0.012) 23px, rgba(255,255,255,0.012) 24px),
+        var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+    header { padding: 0 24px; height: 52px; display: flex; align-items: center; justify-content: space-between; background: var(--surface); border-bottom: 1px dashed var(--border); position: sticky; top: 0; z-index: 20; }
+    header::after {
+      content: '';
+      position: absolute;
+      bottom: -1px;
+      left: 0;
+      width: 100%;
+      height: 1px;
+      background: repeating-linear-gradient(90deg, var(--accent) 0 3px, transparent 3px 7px);
+      opacity: 0.32;
+    }
+    h1 { font-family: var(--mono); font-size: 15px; font-weight: 700; color: var(--accent); letter-spacing: -0.03em; }
     .hdr-r { display: flex; gap: 8px; align-items: center; }
-    .badge { font-family: var(--mono); font-size: 11px; padding: 2px 10px; border-radius: 100px; background: var(--raised); border: 1px solid var(--border); color: var(--text-3); white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; }
+    .badge { font-family: var(--mono); font-size: 11px; padding: 2px 10px; border-radius: 100px; background: var(--raised); border: 1px dashed var(--border); color: var(--text-3); white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; }
     .dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
-    .dot-ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .dot-ok { background: var(--green); box-shadow: 0 0 5px rgba(122,191,138,0.45); }
     .dot-err { background: var(--red); }
+    .dot-warn { background: var(--accent); }
     .dot-off { background: var(--text-3); }
+
+    .status-strip { position: sticky; top: 52px; z-index: 18; background: var(--surface); border-top: 1px dashed rgba(255,255,255,0.04); border-bottom: 1px dashed var(--border); padding: 8px 24px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .status-chip { font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 100px; border: 1px solid var(--border); background: var(--raised); color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; }
 
     .err-banner { display: none; padding: 8px 24px; background: var(--red-bg); border-bottom: 1px solid rgba(248,113,113,0.15); }
     .err-banner.show { display: flex; align-items: center; gap: 8px; }
     .err-banner pre { background: none; padding: 0; margin: 0; font-size: 12px; color: var(--red); max-height: none; overflow: visible; }
 
-    main { padding: 20px 24px; display: grid; gap: 16px; grid-template-columns: 1fr 1fr; max-width: 1440px; margin: 0 auto; }
-    @media (max-width: 960px) { main { grid-template-columns: 1fr; } }
-    .span-2 { grid-column: 1 / -1; }
+    main { padding: 16px 24px 24px; max-width: 1440px; margin: 0 auto; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+    .tab-btn { font-family: var(--mono); font-size: 12px; padding: 7px 12px; border-radius: 100px; border: 1px dashed var(--border); background: var(--surface); color: var(--text-2); cursor: pointer; transition: border-color 0.15s, color 0.15s, background 0.15s; }
+    .tab-btn:hover { border-color: var(--border-hi); color: var(--text); }
+    .tab-btn.active { border-color: rgba(212,148,58,0.5); color: var(--accent); background: var(--accent-bg); }
 
-    .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); display: flex; flex-direction: column; }
-    .ph { padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); min-height: 40px; }
+    .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); display: flex; flex-direction: column; min-height: 460px; position: relative; overflow: hidden; }
+    .panel::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 12px;
+      right: 12px;
+      height: 2px;
+      background: repeating-linear-gradient(90deg, var(--accent) 0 10px, transparent 10px 14px);
+      opacity: 0.18;
+      pointer-events: none;
+    }
+    .ph { padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px dashed var(--border); min-height: 40px; }
     .ph h2 { font-family: var(--mono); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-2); }
-    .ph-r { display: flex; gap: 6px; align-items: center; }
     .pb { padding: 12px 16px; flex: 1; overflow: auto; }
-    .pf { padding: 12px 16px; border-top: 1px solid var(--border); background: rgba(0,0,0,0.15); border-radius: 0 0 var(--r) var(--r); }
+    .hidden { display: none !important; }
 
-    .raw-btn { font-family: var(--mono); font-size: 10px; padding: 1px 8px; border-radius: 100px; background: none; border: 1px solid var(--border); color: var(--text-3); cursor: pointer; transition: all 0.15s; }
-    .raw-btn:hover { border-color: var(--border-hi); color: var(--text-2); }
-
-    pre { font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--text-3); background: var(--bg); padding: 10px 12px; border-radius: var(--r-sm); overflow: auto; max-height: 280px; white-space: pre-wrap; word-break: break-all; margin: 0; }
-    .raw { display: none; margin-top: 10px; }
-    .raw.show { display: block; }
-
+    .raw-btn { font-family: var(--mono); font-size: 10px; padding: 1px 8px; border-radius: 100px; background: none; border: 1px dashed var(--border); color: var(--text-3); cursor: pointer; }
+    pre { font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--text-3); background: var(--bg); border-left: 2px solid rgba(212,148,58,0.14); padding: 10px 12px; border-radius: var(--r-sm); overflow: auto; max-height: 320px; white-space: pre-wrap; word-break: break-all; margin: 10px 0 0; }
     .v-empty { font-family: var(--mono); font-size: 12px; color: var(--text-3); padding: 20px 0; text-align: center; }
-    .v-item { display: flex; align-items: baseline; gap: 10px; padding: 7px 0; font-family: var(--mono); font-size: 12px; border-bottom: 1px solid var(--border); }
-    .v-item:last-child { border-bottom: 0; }
-    .v-name { color: var(--text); font-weight: 600; white-space: nowrap; flex-shrink: 0; }
-    .v-det { color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-size: 11px; }
 
-    .t-row { display: grid; grid-template-columns: minmax(160px, 1fr) 2fr; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--border); align-items: baseline; font-family: var(--mono); font-size: 12px; }
-    .t-row:last-child { border-bottom: 0; }
-    .t-name { color: var(--text); font-weight: 500; }
-    .t-ns { color: var(--text-3); }
-    .t-desc { color: var(--text-3); font-size: 11px; }
-    .p-row { display: flex; flex-direction: column; gap: 4px; padding: 8px 0; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 11px; }
-    .p-row:last-child { border-bottom: 0; }
-    .po-top { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
-    .po-name { color: var(--text); min-width: 0; overflow-wrap: anywhere; }
-    .po-config { display: flex; gap: 6px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
-    .po-desc { color: var(--text-3); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .pill { border: 1px solid var(--border); border-radius: 100px; padding: 1px 8px; font-size: 10px; color: var(--text-2); justify-self: start; }
-    .pill-btn { font-family: var(--mono); background: transparent; cursor: pointer; transition: border-color 0.15s, opacity 0.15s, transform 0.08s; }
-    .pill-btn:hover { border-color: var(--border-hi); }
-    .pill-btn:active { transform: scale(0.98); }
-    .pill-btn:disabled { opacity: 0.5; cursor: wait; transform: none; }
-    .pill-safe { border-color: rgba(74,222,128,0.35); color: var(--green); background: rgba(74,222,128,0.08); }
-    .pill-esc { border-color: rgba(248,113,113,0.35); color: var(--red); background: rgba(248,113,113,0.08); }
-    .pill-src { color: var(--text-3); }
+    .server-add { display: grid; grid-template-columns: 1fr 2fr 1fr 1fr auto; gap: 8px; margin-bottom: 12px; }
+    .server-list { display: grid; gap: 10px; }
+    .server-card { border: 1px dashed var(--border); border-radius: var(--r-sm); background: rgba(0,0,0,0.16); padding: 10px; display: grid; gap: 8px; position: relative; }
+    .server-card::before, .server-card::after {
+      content: '+';
+      position: absolute;
+      font-family: var(--mono);
+      font-size: 8px;
+      line-height: 1;
+      color: var(--text-3);
+      opacity: 0.35;
+    }
+    .server-card::before { top: 2px; left: 4px; }
+    .server-card::after { bottom: 2px; right: 4px; }
+    .server-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .server-title { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; min-width: 0; }
+    .server-name { color: var(--text); font-weight: 600; }
+    .server-url { color: var(--text-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .server-controls { display: grid; grid-template-columns: 1fr 1fr auto auto auto; gap: 8px; align-items: center; }
+    .auth-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-family: var(--mono); font-size: 11px; color: var(--text-2); }
+    .chip-auth { display: inline-flex; align-items: center; gap: 6px; }
 
-    .fail { padding: 6px 8px; background: var(--red-bg); border-radius: var(--r-sm); font-family: var(--mono); font-size: 11px; color: var(--red); margin-bottom: 8px; }
+    input, select, textarea { font-family: var(--mono); font-size: 12px; padding: 7px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); outline: none; }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(212,148,58,0.15); }
+    input::placeholder, textarea::placeholder { color: var(--text-3); }
+    select:disabled, input:disabled, textarea:disabled { opacity: 0.45; cursor: not-allowed; }
+    textarea { min-height: 72px; resize: vertical; }
 
-    .a-item { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; font-family: var(--mono); font-size: 12px; border-bottom: 1px solid var(--border); }
-    .a-item:last-child { border-bottom: 0; }
-    .a-right { display: flex; align-items: center; gap: 8px; }
-    .a-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-    .a-ok { background: var(--green); }
-    .a-no { background: var(--text-3); }
-    .a-bad { background: var(--red); }
-    .a-warn { background: var(--accent); }
-
-    form { display: flex; flex-direction: column; gap: 8px; }
-    form + form { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
-    .row { display: grid; gap: 8px; grid-template-columns: 1fr 1fr; }
-    .f-label { font-size: 11px; color: var(--text-2); margin-bottom: -2px; }
-    input, select { font-family: var(--mono); font-size: 12px; padding: 7px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); outline: none; transition: border-color 0.15s; }
-    input::placeholder { color: var(--text-3); }
-    input:focus, select:focus { border-color: var(--accent); }
-    select { cursor: pointer; }
-    select:disabled, input:disabled { opacity: 0.35; cursor: not-allowed; }
-    button[type='submit'] { font-family: var(--sans); font-size: 12px; font-weight: 600; padding: 7px 16px; background: var(--accent); color: var(--bg); border: none; border-radius: var(--r-sm); cursor: pointer; transition: opacity 0.15s, transform 0.1s; }
-    button[type='submit']:hover { opacity: 0.88; }
-    button[type='submit']:active { transform: scale(0.98); }
-    button[type='submit']:disabled { opacity: 0.3; cursor: not-allowed; transform: none; }
+    button { font-family: var(--sans); font-size: 12px; font-weight: 600; padding: 7px 12px; border: none; border-radius: var(--r-sm); cursor: pointer; background: var(--accent); color: #101113; }
+    button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.45; cursor: wait; }
+    .btn-quiet { background: transparent; color: var(--text-2); border: 1px dashed var(--border); }
+    .btn-quiet:hover { border-color: var(--border-hi); color: var(--text); }
     .btn-d { background: var(--red-bg); border: 1px solid rgba(248,113,113,0.4); color: var(--red); }
-    .btn-d:hover { background: rgba(248,113,113,0.14); border-color: rgba(248,113,113,0.6); opacity: 1; }
-    .btn-d:disabled { background: transparent; border-color: rgba(248,113,113,0.15); }
-    .note { font-size: 11px; color: var(--text-3); margin-top: 6px; }
 
-    .logs-pre { max-height: 220px; min-height: 48px; border-radius: 0 0 var(--r) var(--r); }
-    .logs-pre:empty::after { content: 'no log entries'; color: var(--text-3); }
+    .tool-toolbar { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 8px; margin-bottom: 12px; }
+    .tool-list { display: grid; gap: 8px; }
+    .tool-row { border: 1px dashed var(--border); border-radius: var(--r-sm); background: rgba(0,0,0,0.16); padding: 10px; display: grid; gap: 8px; position: relative; }
+    .tool-row::before, .tool-row::after {
+      content: '+';
+      position: absolute;
+      font-family: var(--mono);
+      font-size: 8px;
+      line-height: 1;
+      color: var(--text-3);
+      opacity: 0.35;
+    }
+    .tool-row::before { top: 2px; left: 4px; }
+    .tool-row::after { bottom: 2px; right: 4px; }
+    .tool-top { display: grid; grid-template-columns: auto minmax(0,1fr) auto; gap: 10px; align-items: center; }
+    .tool-actions { display: inline-flex; gap: 6px; }
+    .tool-name { font-family: var(--mono); font-size: 12px; color: var(--text); min-width: 0; overflow-wrap: anywhere; }
+    .tool-ns { color: var(--text-3); }
+    .tool-desc { font-family: var(--mono); font-size: 11px; color: var(--text-2); display: grid; gap: 7px; }
+    .desc-value { cursor: pointer; border: 1px solid transparent; border-radius: var(--r-sm); padding: 6px; margin: -6px; }
+    .desc-value:hover { border-color: var(--border); background: rgba(255,255,255,0.01); }
+    .desc-edit-actions { display: inline-flex; gap: 6px; }
+    .desc-diff { border: 1px solid var(--border); border-radius: var(--r-sm); padding: 6px; background: rgba(0,0,0,0.2); display: grid; gap: 4px; font-size: 10px; }
+    .diff-old { color: var(--text-3); }
+    .diff-new { color: var(--accent); }
+    .pill { border: 1px solid var(--border); border-radius: 100px; padding: 1px 8px; font-size: 10px; color: var(--text-2); background: transparent; }
+    .pill-btn { font-family: var(--mono); cursor: pointer; border: 1px solid var(--border); border-radius: 100px; padding: 2px 8px; background: transparent; color: var(--text-2); }
+    .pill-safe { border-color: rgba(122,191,138,0.35); color: var(--green); background: rgba(122,191,138,0.08); }
+    .pill-esc { border-color: rgba(212,106,106,0.35); color: var(--red); background: rgba(212,106,106,0.09); }
+    .pill-src { color: var(--text-3); }
+    .pill-override { border-color: rgba(212,148,58,0.5); color: var(--accent); background: var(--accent-bg); }
+    .fail { padding: 6px 8px; background: var(--red-bg); border-left: 2px solid var(--red); border-radius: 0 var(--r-sm) var(--r-sm) 0; font-family: var(--mono); font-size: 11px; color: var(--red); margin-bottom: 8px; }
 
-    @keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-    .panel { animation: fadeUp 0.35s ease both; }
-    .panel:nth-child(1) { animation-delay: 0s; }
-    .panel:nth-child(2) { animation-delay: 0.04s; }
-    .panel:nth-child(3) { animation-delay: 0.08s; }
-    .panel:nth-child(4) { animation-delay: 0.12s; }
-    .panel:nth-child(5) { animation-delay: 0.16s; }
-
-    ::-webkit-scrollbar { width: 5px; height: 5px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: var(--border-hi); }
-
+    .logs-pre { max-height: 72vh; min-height: 260px; margin: 0; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0; }
+    @media (max-width: 960px) {
+      .server-add { grid-template-columns: 1fr; }
+      .server-controls { grid-template-columns: 1fr; }
+      .tool-toolbar { grid-template-columns: 1fr; }
+      .tool-top { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -483,162 +532,102 @@ async fn root() -> Html<&'static str> {
     <div class="hdr-r" id="status-bar"></div>
   </header>
 
+  <div class="status-strip" id="status-strip"></div>
+
   <div class="err-banner" id="error-banner">
     <pre id="errors">(none)</pre>
   </div>
 
   <main>
-    <section class="panel">
-      <div class="ph"><h2>Servers</h2><button class="raw-btn" onclick="toggleRaw(this,'servers')">json</button></div>
+    <div class="tabs">
+      <button class="tab-btn" data-tab="servers">Servers</button>
+      <button class="tab-btn" data-tab="tools">Tools</button>
+      <button class="tab-btn" data-tab="logs">Logs</button>
+    </div>
+
+    <section class="panel" id="tab-servers">
+      <div class="ph"><h2>Servers</h2><button class="raw-btn" data-raw-toggle="servers">json</button></div>
       <div class="pb">
-        <div id="servers-view"></div>
-        <pre id="servers" class="raw">loading...</pre>
-      </div>
-      <div class="pf">
-        <form id="server-add-form">
-          <div class="row">
-            <input id="server-name" placeholder="server name (e.g. github)" required>
-            <input id="server-url" placeholder="url (e.g. stdio://... or https://...)" required>
-            <select id="server-exposure-add">
-              <option value="passthrough">passthrough</option>
-              <option value="compact">compact</option>
-              <option value="names-only">names-only</option>
-              <option value="server-only">server-only</option>
-            </select>
-            <select id="server-policy-add">
-              <option value="heuristic">heuristic</option>
-              <option value="all-safe">all-safe</option>
-              <option value="all-escalated">all-escalated</option>
-              <option value="custom">custom</option>
-            </select>
-          </div>
+        <form id="server-add-form" class="server-add">
+          <input id="server-name" placeholder="server name (e.g. github)" required>
+          <input id="server-url" placeholder="url (e.g. stdio://... or https://...)" required>
+          <select id="server-exposure-add">
+            <option value="passthrough">passthrough</option>
+            <option value="compact">compact</option>
+            <option value="names-only">names-only</option>
+            <option value="server-only">server-only</option>
+          </select>
+          <select id="server-policy-add">
+            <option value="heuristic">heuristic</option>
+            <option value="all-safe">all-safe</option>
+            <option value="all-escalated">all-escalated</option>
+            <option value="custom">custom</option>
+          </select>
           <button type="submit">Add Server</button>
         </form>
-        <form id="server-exposure-form">
-          <div class="row">
-            <select id="server-exposure-name"></select>
-            <select id="server-exposure-mode">
-              <option value="passthrough">passthrough</option>
-              <option value="compact">compact</option>
-              <option value="names-only">names-only</option>
-              <option value="server-only">server-only</option>
-            </select>
-            <button type="submit">Set Exposure</button>
-          </div>
-        </form>
-        <form id="server-remove-form">
-          <div class="row">
-            <select id="server-remove-name"></select>
-            <button type="submit" class="btn-d">Remove Server</button>
-          </div>
-        </form>
+        <div id="servers-view" class="server-list"></div>
+        <pre id="servers-raw" class="hidden">loading...</pre>
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel hidden" id="tab-tools">
       <div class="ph">
         <h2>Tools</h2>
-        <div class="ph-r">
+        <div class="hdr-r">
           <span class="badge" id="tool-count"></span>
-          <button class="raw-btn" onclick="toggleRaw(this,'tools')">json</button>
+          <button class="raw-btn" data-raw-toggle="tools">json</button>
         </div>
       </div>
-      <div class="pb" style="max-height:480px;overflow:auto;">
-        <div id="tools-view"></div>
-        <pre id="tools" class="raw">loading...</pre>
-      </div>
-    </section>
-
-    <section class="panel">
-      <div class="ph"><h2>Policy & Overrides</h2><button class="raw-btn" onclick="toggleRaw(this,'policies')">json</button></div>
       <div class="pb">
-        <div id="policies-view"></div>
-        <pre id="policies" class="raw">loading...</pre>
-        <div id="overrides-view" style="margin-top:10px;"></div>
-        <pre id="overrides" class="raw">loading...</pre>
-        <div class="note">Default safe heuristic: tool name starts with get/list/search/lookup/fetch, or description starts with get.</div>
-      </div>
-      <div class="pf">
-        <form id="server-policy-mode-form">
-          <span class="f-label">catalog policy mode</span>
-          <div class="row">
-            <select id="policy-server-mode-name"></select>
-            <select id="policy-server-mode">
-              <option value="heuristic">heuristic</option>
-              <option value="all-safe">all-safe</option>
-              <option value="all-escalated">all-escalated</option>
-              <option value="custom">custom</option>
-            </select>
-          </div>
-          <button type="submit">Set Catalog Mode</button>
-        </form>
-        <form id="policy-override-set-form">
-          <span class="f-label">set tool policy override</span>
-          <div class="row">
-            <select id="policy-override-server"></select>
-            <input id="policy-override-tool" placeholder="upstream tool name (e.g. search_issues)" required>
-          </div>
-          <div class="row">
-            <select id="policy-override-level">
-              <option value="safe">safe</option>
-              <option value="escalated">escalated</option>
-            </select>
-          </div>
-          <button type="submit">Save Policy Override</button>
-        </form>
-        <form id="policy-override-remove-form">
-          <span class="f-label">remove tool policy override</span>
-          <div class="row">
-            <select id="policy-override-remove-server"></select>
-            <input id="policy-override-remove-tool" placeholder="upstream tool name to remove" required>
-          </div>
-          <button type="submit" class="btn-d">Remove Policy Override</button>
-        </form>
-        <form id="override-set-form">
-          <span class="f-label">set description override</span>
-          <div class="row">
-            <select id="override-server"></select>
-            <input id="override-tool" placeholder="upstream tool name (e.g. search_issues)" required>
-          </div>
-          <input id="override-description" placeholder="description sent to MCP clients" required>
-          <button type="submit">Save Description Override</button>
-        </form>
-        <form id="override-remove-form">
-          <span class="f-label">remove description override</span>
-          <div class="row">
-            <select id="override-remove-server"></select>
-            <input id="override-remove-tool" placeholder="upstream tool name to remove" required>
-          </div>
-          <button type="submit" class="btn-d">Remove Description Override</button>
-        </form>
+        <div class="tool-toolbar">
+          <input id="tool-filter-text" placeholder="filter by name or description">
+          <select id="tool-filter-server"></select>
+          <select id="tool-filter-policy">
+            <option value="all">all policies</option>
+            <option value="safe">safe</option>
+            <option value="escalated">escalated</option>
+          </select>
+          <button type="button" id="tool-filter-reset" class="btn-quiet">Reset</button>
+        </div>
+        <div id="tools-failures"></div>
+        <div id="tools-view" class="tool-list"></div>
+        <pre id="tools-raw" class="hidden">loading...</pre>
       </div>
     </section>
 
-    <section class="panel">
-      <div class="ph"><h2>Auth</h2><button class="raw-btn" onclick="toggleRaw(this,'auth')">json</button></div>
+    <section class="panel hidden" id="tab-logs">
+      <div class="ph"><h2>Logs</h2><button class="raw-btn" data-raw-toggle="logs">json</button></div>
       <div class="pb">
-        <div id="auth-view"></div>
-        <pre id="auth" class="raw">loading...</pre>
+        <pre id="logs" class="logs-pre">loading...</pre>
+        <pre id="logs-raw" class="hidden">loading...</pre>
       </div>
-    </section>
-
-    <section class="panel span-2">
-      <div class="ph"><h2>Logs</h2></div>
-      <pre id="logs" class="logs-pre">loading...</pre>
     </section>
   </main>
 
   <pre id="status" class="sr-only">loading...</pre>
 
   <script>
-    let currentServers = [];
+    const TOOL_REFRESH_INTERVAL_MS = 15000;
+    const REFRESH_INTERVAL_MS = 3000;
     let refreshInFlight = false;
-    let TOOL_REFRESH_INTERVAL_MS = 15000;
-    let REFRESH_INTERVAL_MS = 3000;
-    let panelState = {
+    let clearRemoveConfirmTimer = null;
+
+    const state = {
+      currentServers: [],
+      serverPolicyModes: {},
+      descriptionOverrides: {},
+      authStatuses: [],
       toolsPayload: null,
       toolsRefreshAtMs: 0,
-      serverPolicyModes: {}
+      activeTab: 'servers',
+      rawVisible: { servers: false, tools: false, logs: false },
+      filterText: '',
+      filterServer: 'all',
+      filterPolicy: 'all',
+      editingToolKey: null,
+      editingDraft: '',
+      showDiff: false,
+      confirmRemoveServer: null
     };
 
     function esc(s) {
@@ -648,11 +637,46 @@ async fn root() -> Html<&'static str> {
       return d.innerHTML;
     }
 
-    function toggleRaw(btn, id) {
-      const el = document.getElementById(id);
+    function escAttrHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function readHashTab() {
+      const hash = window.location.hash.replace('#', '').trim();
+      if (hash === 'servers' || hash === 'tools' || hash === 'logs') {
+        return hash;
+      }
+      return 'servers';
+    }
+
+    function setActiveTab(tab) {
+      state.activeTab = tab;
+      window.location.hash = tab;
+      const tabs = ['servers', 'tools', 'logs'];
+      for (const t of tabs) {
+        const btn = document.querySelector('.tab-btn[data-tab="' + t + '"]');
+        const pane = document.getElementById('tab-' + t);
+        if (!btn || !pane) continue;
+        const active = t === tab;
+        btn.classList.toggle('active', active);
+        pane.classList.toggle('hidden', !active);
+      }
+    }
+
+    function toggleRaw(kind) {
+      state.rawVisible[kind] = !state.rawVisible[kind];
+      const el = document.getElementById(kind + '-raw');
       if (!el) return;
-      el.classList.toggle('show');
-      btn.textContent = el.classList.contains('show') ? 'hide' : 'json';
+      el.classList.toggle('hidden', !state.rawVisible[kind]);
+      const btn = document.querySelector('[data-raw-toggle="' + kind + '"]');
+      if (btn) {
+        btn.textContent = state.rawVisible[kind] ? 'hide' : 'json';
+      }
     }
 
     function setError(message) {
@@ -674,62 +698,6 @@ async fn root() -> Html<&'static str> {
       return body;
     }
 
-    function setServerOptions(selectId, servers) {
-      const select = document.getElementById(selectId);
-      if (!select) return;
-      select.replaceChildren();
-      if (!servers.length) {
-        const option = document.createElement('option');
-        option.value = '';
-        option.selected = true;
-        option.disabled = true;
-        option.textContent = '(no servers)';
-        select.append(option);
-        return;
-      }
-      for (const server of servers) {
-        const option = document.createElement('option');
-        option.value = server.name;
-        option.textContent = server.name;
-        select.append(option);
-      }
-      select.selectedIndex = 0;
-    }
-
-    function hasConfiguredServers() {
-      return Array.isArray(currentServers) && currentServers.length > 0;
-    }
-
-    function setMutationFormState() {
-      const hasServers = hasConfiguredServers();
-      document.getElementById('server-remove-name').disabled = !hasServers;
-      document.querySelector('#server-remove-form button[type=submit]').disabled = !hasServers;
-      document.getElementById('server-exposure-name').disabled = !hasServers;
-      document.getElementById('server-exposure-mode').disabled = !hasServers;
-      document.querySelector('#server-exposure-form button[type=submit]').disabled = !hasServers;
-      document.getElementById('policy-server-mode-name').disabled = !hasServers;
-      document.getElementById('policy-server-mode').disabled = !hasServers;
-      document.querySelector('#server-policy-mode-form button[type=submit]').disabled = !hasServers;
-      document.getElementById('policy-override-server').disabled = !hasServers;
-      document.getElementById('policy-override-level').disabled = !hasServers;
-      document.querySelector('#policy-override-set-form button[type=submit]').disabled = !hasServers;
-      document.getElementById('policy-override-remove-server').disabled = !hasServers;
-      document.querySelector('#policy-override-remove-form button[type=submit]').disabled = !hasServers;
-      document.getElementById('override-server').disabled = !hasServers;
-      document.querySelector('#override-set-form button[type=submit]').disabled = !hasServers;
-      document.getElementById('override-remove-server').disabled = !hasServers;
-      document.querySelector('#override-remove-form button[type=submit]').disabled = !hasServers;
-    }
-
-    function syncSelectedServerPolicyMode() {
-      const selectServer = document.getElementById('policy-server-mode-name');
-      const selectMode = document.getElementById('policy-server-mode');
-      if (!selectServer || !selectMode) return;
-      const serverName = selectServer.value;
-      const mode = (panelState.serverPolicyModes && panelState.serverPolicyModes[serverName]) || 'heuristic';
-      selectMode.value = mode;
-    }
-
     async function fetchJson(path, label) {
       const response = await fetch(path);
       if (!response.ok) {
@@ -741,8 +709,15 @@ async fn root() -> Html<&'static str> {
 
     function shouldRefreshTools(forceTools) {
       if (forceTools) return true;
-      if (!panelState.toolsPayload) return true;
-      return Date.now() - panelState.toolsRefreshAtMs >= TOOL_REFRESH_INTERVAL_MS;
+      if (!state.toolsPayload) return true;
+      return Date.now() - state.toolsRefreshAtMs >= TOOL_REFRESH_INTERVAL_MS;
+    }
+
+    function captureEditingDraftFromDom() {
+      if (!state.editingToolKey) return;
+      const textarea = document.getElementById('edit-desc-text');
+      if (!textarea) return;
+      state.editingDraft = textarea.value || '';
     }
 
     function renderStatusBar(p) {
@@ -759,146 +734,228 @@ async fn root() -> Html<&'static str> {
       bar.innerHTML = h;
     }
 
-    function renderServersView(servers) {
+    function authViewModelByServer(serverName) {
+      for (let i = 0; i < state.authStatuses.length; i++) {
+        if (state.authStatuses[i].server === serverName) {
+          return state.authStatuses[i];
+        }
+      }
+      return null;
+    }
+
+    function statusChipForAuth(auth, serverEnabled) {
+      if (!serverEnabled) {
+        return { dot: 'dot-off', text: 'disabled', action: '' };
+      }
+      if (!auth || !auth.oauth_configured) {
+        return { dot: 'dot-off', text: 'not configured', action: '' };
+      }
+      if (auth.last_error) {
+        return { dot: 'dot-err', text: auth.last_error, action: 'refresh' };
+      }
+      if (auth.degraded) {
+        return { dot: 'dot-warn', text: 'degraded', action: 'refresh' };
+      }
+      if (auth.has_token) {
+        return { dot: 'dot-ok', text: 'authenticated', action: '' };
+      }
+      return { dot: 'dot-off', text: 'no token', action: 'login' };
+    }
+
+    function renderStatusStrip() {
+      const strip = document.getElementById('status-strip');
+      const servers = Array.isArray(state.currentServers) ? state.currentServers : [];
+      if (!servers.length) {
+        strip.innerHTML = '<span class="status-chip"><span class="dot dot-off"></span>no servers configured</span>';
+        return;
+      }
+      let h = '';
+      for (const server of servers) {
+        const auth = authViewModelByServer(server.name);
+        const status = statusChipForAuth(auth, server.enabled !== false);
+        h += '<span class="status-chip"><span class="dot ' + status.dot + '"></span>' + esc(server.name) + ': ' + esc(status.text) + '</span>';
+        if (status.action === 'login') {
+          h += '<button class="btn-quiet" type="button" data-action="status-login" data-server="' + escAttrHtml(server.name) + '">login</button>';
+        }
+        if (status.action === 'refresh') {
+          h += '<button class="btn-quiet" type="button" data-action="status-refresh" data-server="' + escAttrHtml(server.name) + '">refresh</button>';
+        }
+      }
+      strip.innerHTML = h;
+    }
+
+    function renderServersView() {
       const v = document.getElementById('servers-view');
-      if (!servers || !servers.length) {
+      const servers = Array.isArray(state.currentServers) ? state.currentServers : [];
+      if (!servers.length) {
         v.innerHTML = '<div class="v-empty">no servers configured</div>';
         return;
       }
-      v.innerHTML = servers.map(function(s) {
+      let h = '';
+      for (const s of servers) {
         const exposure = s.exposure_mode || 'passthrough';
-        const policy = (panelState.serverPolicyModes && panelState.serverPolicyModes[s.name]) || 'heuristic';
-        return '<div class="v-item"><span class="v-name">' + esc(s.name) + '</span><span class="v-det">' + esc(s.url) + ' · exposure=' + esc(exposure) + ' · policy=' + esc(policy) + '</span></div>';
+        const policy = (state.serverPolicyModes && state.serverPolicyModes[s.name]) || 'heuristic';
+        const enabled = s.enabled !== false;
+        const auth = authViewModelByServer(s.name);
+        const authStatus = statusChipForAuth(auth, enabled);
+        const toggleLabel = enabled ? 'Deactivate' : 'Activate';
+        const wantsConfirm = state.confirmRemoveServer === s.name;
+        h += '<article class="server-card">';
+        h += '<div class="server-head"><div class="server-title"><span class="dot ' + authStatus.dot + '"></span><span class="server-name">' + esc(s.name) + '</span></div><span class="server-url">' + esc(s.url) + '</span></div>';
+        h += '<div class="server-controls">';
+        h += '<select class="server-exposure-select" data-server="' + escAttrHtml(s.name) + '">' + exposureOptions(exposure) + '</select>';
+        h += '<select class="server-policy-select" data-server="' + escAttrHtml(s.name) + '">' + policyOptions(policy) + '</select>';
+        if (authStatus.action === 'login') {
+          h += '<button type="button" class="btn-quiet" data-action="server-login" data-server="' + escAttrHtml(s.name) + '">Login</button>';
+        } else if (authStatus.action === 'refresh') {
+          h += '<button type="button" class="btn-quiet" data-action="server-refresh" data-server="' + escAttrHtml(s.name) + '">Refresh</button>';
+        } else {
+          h += '<span class="pill pill-src">' + (enabled ? 'auth ok' : 'disabled') + '</span>';
+        }
+        h += '<button type="button" class="btn-quiet" data-action="toggle-server" data-server="' + escAttrHtml(s.name) + '" data-enabled="' + escAttrHtml(String(enabled)) + '">' + toggleLabel + '</button>';
+        h += '<button type="button" class="btn-d" data-action="remove-server" data-server="' + escAttrHtml(s.name) + '">' + (wantsConfirm ? 'Confirm Remove' : 'Remove') + '</button>';
+        h += '</div>';
+        h += '<div class="auth-line"><span class="chip-auth"><span class="dot ' + authStatus.dot + '"></span>' + esc(authStatus.text) + '</span><span class="pill pill-src">state=' + (enabled ? 'enabled' : 'disabled') + ' · exposure=' + esc(exposure) + ' · policy=' + esc(policy) + '</span></div>';
+        h += '</article>';
+      }
+      v.innerHTML = h;
+    }
+
+    function exposureOptions(selected) {
+      const options = ['passthrough', 'compact', 'names-only', 'server-only'];
+      return options.map(function(value) {
+        const sel = value === selected ? ' selected' : '';
+        return '<option value="' + value + '"' + sel + '>' + value + '</option>';
       }).join('');
     }
 
-    function renderToolsView(p) {
+    function policyOptions(selected) {
+      const options = ['heuristic', 'all-safe', 'all-escalated', 'custom'];
+      return options.map(function(value) {
+        const sel = value === selected ? ' selected' : '';
+        return '<option value="' + value + '"' + sel + '>' + value + '</option>';
+      }).join('');
+    }
+
+    function toolKey(server, tool) {
+      return server + '::' + tool;
+    }
+
+    function overrideText(server, tool) {
+      const byServer = state.descriptionOverrides && state.descriptionOverrides[server];
+      if (!byServer) return null;
+      const value = byServer[tool];
+      return typeof value === 'string' ? value : null;
+    }
+
+    function renderToolFilters() {
+      const filterServer = document.getElementById('tool-filter-server');
+      if (!filterServer) return;
+      const selected = state.filterServer || 'all';
+      let h = '<option value="all">all servers</option>';
+      for (const server of state.currentServers) {
+        const sel = server.name === selected ? ' selected' : '';
+        h += '<option value="' + escAttrHtml(server.name) + '"' + sel + '>' + esc(server.name) + '</option>';
+      }
+      filterServer.innerHTML = h;
+      document.getElementById('tool-filter-text').value = state.filterText || '';
+      document.getElementById('tool-filter-policy').value = state.filterPolicy || 'all';
+    }
+
+    function filteredToolDetails() {
+      if (!state.toolsPayload || !Array.isArray(state.toolsPayload.tool_details)) return [];
+      const text = (state.filterText || '').toLowerCase();
+      const server = state.filterServer || 'all';
+      const policy = state.filterPolicy || 'all';
+      return state.toolsPayload.tool_details.filter(function(t) {
+        if (!t.server) return false;
+        if (server !== 'all' && t.server !== server) return false;
+        if (policy !== 'all' && t.policy_level !== policy) return false;
+        if (!text) return true;
+        const hay = (t.name + ' ' + (t.description || '')).toLowerCase();
+        return hay.includes(text);
+      });
+    }
+
+    function renderToolsView() {
+      const p = state.toolsPayload;
       const v = document.getElementById('tools-view');
       const c = document.getElementById('tool-count');
+      const failures = document.getElementById('tools-failures');
       if (!p || !p.tool_details) {
         v.innerHTML = '<div class="v-empty">discovering tools</div>';
+        failures.innerHTML = '';
         c.textContent = '';
         return;
       }
       c.textContent = p.tool_details.length;
+      let failuresHtml = '';
       let h = '';
       if (p.failures && p.failures.length) {
         for (let i = 0; i < p.failures.length; i++) {
-          h += '<div class="fail">' + esc(p.failures[i].server) + ': ' + esc(p.failures[i].error) + '</div>';
+          failuresHtml += '<div class="fail">' + esc(p.failures[i].server) + ': ' + esc(p.failures[i].error) + '</div>';
         }
       }
-      for (let i = 0; i < p.tool_details.length; i++) {
-        const t = p.tool_details[i];
-        const idx = t.name.indexOf(':');
-        let nm;
+      failures.innerHTML = failuresHtml;
+
+      const tools = filteredToolDetails();
+      if (!tools.length) {
+        v.innerHTML = '<div class="v-empty">no tools match this filter</div>';
+        return;
+      }
+
+      for (const t of tools) {
+        const fullName = t.name || '';
+        const idx = fullName.indexOf(':');
+        let nsPrefix = '';
+        let toolName = fullName;
         if (idx > -1) {
-          nm = '<span class="t-ns">' + esc(t.name.substring(0, idx + 1)) + '</span>' + esc(t.name.substring(idx + 1));
+          nsPrefix = fullName.substring(0, idx + 1);
+          toolName = fullName.substring(idx + 1);
+        }
+        const key = toolKey(t.server, t.upstream_name || toolName);
+        const activeSafe = t.policy_level === 'safe';
+        const safeClass = activeSafe ? 'pill-btn pill-safe' : 'pill-btn';
+        const escClass = !activeSafe ? 'pill-btn pill-esc' : 'pill-btn';
+        const override = overrideText(t.server, t.upstream_name || toolName);
+        const isEditing = state.editingToolKey === key;
+        const original = typeof t.original_description === 'string' ? t.original_description : '';
+        const source = t.policy_source || 'heuristic';
+        h += '<article class="tool-row">';
+        h += '<div class="tool-top">';
+        h += '<div class="tool-actions">';
+        h += '<button type="button" class="' + safeClass + '" data-action="set-policy" data-server="' + escAttrHtml(t.server) + '" data-tool="' + escAttrHtml(t.upstream_name || toolName) + '" data-level="safe">safe</button>';
+        h += '<button type="button" class="' + escClass + '" data-action="set-policy" data-server="' + escAttrHtml(t.server) + '" data-tool="' + escAttrHtml(t.upstream_name || toolName) + '" data-level="escalated">escalated</button>';
+        h += '</div>';
+        h += '<div class="tool-name"><span class="tool-ns">' + esc(nsPrefix) + '</span>' + esc(toolName) + '</div>';
+        h += '<span class="pill pill-src">' + esc(source) + '</span>';
+        h += '</div>';
+        h += '<div class="tool-desc">';
+        if (isEditing) {
+          h += '<textarea id="edit-desc-text">' + esc(state.editingDraft) + '</textarea>';
+          h += '<div class="desc-edit-actions">';
+          h += '<button type="button" data-action="save-desc" data-server="' + escAttrHtml(t.server) + '" data-tool="' + escAttrHtml(t.upstream_name || toolName) + '">Save Override</button>';
+          h += '<button type="button" class="btn-quiet" data-action="cancel-desc">Cancel</button>';
+          if (override && original) {
+            h += '<button type="button" class="btn-quiet" data-action="toggle-diff">' + (state.showDiff ? 'Hide Diff' : 'Show Diff') + '</button>';
+          }
+          h += '</div>';
+          if (state.showDiff && override && original) {
+            h += '<div class="desc-diff"><div class="diff-old">- ' + esc(original) + '</div><div class="diff-new">+ ' + esc(state.editingDraft) + '</div></div>';
+          }
         } else {
-          nm = esc(t.name);
-        }
-        h += '<div class="t-row"><span class="t-name">' + nm + '</span><span class="t-desc">' + esc(t.description) + '</span></div>';
-      }
-      v.innerHTML = h;
-    }
-
-    function renderPoliciesView(toolsPayload, serversPayload) {
-      const v = document.getElementById('policies-view');
-      const servers = Array.isArray(currentServers) ? currentServers : [];
-      if (!servers.length) {
-        v.innerHTML = '<div class="v-empty">no policy data</div>';
-        return;
-      }
-      const byServer = {};
-      const details = (toolsPayload && Array.isArray(toolsPayload.tool_details)) ? toolsPayload.tool_details : [];
-      for (let i = 0; i < details.length; i++) {
-        const t = details[i];
-        if (!t || !t.server) continue;
-        if (!byServer[t.server]) byServer[t.server] = [];
-        byServer[t.server].push(t);
-      }
-      const serverModes = (serversPayload && serversPayload.server_tool_policy_modes) || {};
-      const policyOverrides = (serversPayload && serversPayload.tool_policy_overrides) || {};
-      let h = '';
-      for (let i = 0; i < servers.length; i++) {
-        const serverName = servers[i].name;
-        const mode = serverModes[serverName] || 'heuristic';
-        const tools = (byServer[serverName] || []).slice().sort(function(a, b) {
-          return (a.upstream_name || '').localeCompare(b.upstream_name || '');
-        });
-        const safeCount = tools.filter(function(t) { return t.policy_level === 'safe'; }).length;
-        const escalatedCount = tools.length - safeCount;
-        const overrideCount = Object.keys(policyOverrides[serverName] || {}).length;
-        h += '<div class="t-row"><span class="t-name">' + esc(serverName) + '</span><span class="t-desc">mode=' + esc(mode) + ' · safe=' + safeCount + ' · escalated=' + escalatedCount + ' · overrides=' + overrideCount + '</span></div>';
-        if (!tools.length) {
-          h += '<div class="v-item"><span class="v-det">no discovered tools</span></div>';
-          continue;
-        }
-        for (let j = 0; j < tools.length; j++) {
-          const level = tools[j].policy_level || 'escalated';
-          const source = tools[j].policy_source || 'heuristic';
-          const levelClass = level === 'safe' ? 'pill-safe' : 'pill-esc';
-          const toolName = tools[j].upstream_name || tools[j].name || '';
-          h += '<div class="p-row">';
-          h += '<div class="po-top"><span class="po-name"><span class="t-ns">' + esc(serverName) + ':</span>' + esc(toolName) + '</span><span class="po-config">';
-          h += '<button type="button" class="pill pill-btn ' + levelClass + '" data-action="toggle-policy-level" data-server="' + escAttrHtml(serverName) + '" data-tool="' + escAttrHtml(toolName) + '" data-level="' + escAttrHtml(level) + '" title="toggle safe/escalated and save">' + esc(level) + '</button>';
-          h += '<span class="pill pill-src">' + esc(source) + '</span>';
-          h += '</span></div>';
-          h += '<div class="po-desc">' + esc(tools[j].description || '') + '</div>';
+          h += '<div class="desc-value" data-action="edit-desc" data-key="' + escAttrHtml(key) + '">' + esc(t.description || '') + '</div>';
+          h += '<div class="desc-edit-actions">';
+          if (override) {
+            h += '<span class="pill pill-override">override</span>';
+            h += '<button type="button" class="btn-quiet" data-action="restore-desc" data-server="' + escAttrHtml(t.server) + '" data-tool="' + escAttrHtml(t.upstream_name || toolName) + '">Restore</button>';
+          }
           h += '</div>';
         }
+        h += '</div>';
+        h += '</article>';
       }
       v.innerHTML = h;
-    }
-
-    function renderOverridesView(overrides) {
-      const v = document.getElementById('overrides-view');
-      if (!overrides || !Object.keys(overrides).length) {
-        v.innerHTML = '<div class="v-empty">no overrides</div>';
-        return;
-      }
-      let h = '';
-      const srvs = Object.keys(overrides).sort();
-      for (let i = 0; i < srvs.length; i++) {
-        const tools = Object.keys(overrides[srvs[i]]).sort();
-        for (let j = 0; j < tools.length; j++) {
-          h += '<div class="p-row">';
-          h += '<div class="po-top"><span class="po-name"><span class="t-ns">' + esc(srvs[i]) + ':</span>' + esc(tools[j]) + '</span><span class="po-config"><span class="pill pill-src">description override</span></span></div>';
-          h += '<div class="po-desc">' + esc(overrides[srvs[i]][tools[j]]) + '</div>';
-          h += '</div>';
-        }
-      }
-      v.innerHTML = h;
-    }
-
-    function renderAuthView(p) {
-      const v = document.getElementById('auth-view');
-      if (!p || !p.statuses || !p.statuses.length) {
-        v.innerHTML = '<div class="v-empty">no auth configured</div>';
-        return;
-      }
-      let h = '';
-      for (let i = 0; i < p.statuses.length; i++) {
-        const s = p.statuses[i];
-        let dot = 'a-no', label = 'not configured';
-        if (s.oauth_configured && !s.has_token) { dot = 'a-no'; label = 'no token'; }
-        if (s.has_token) { dot = 'a-ok'; label = 'authenticated'; }
-        if (s.degraded) { dot = 'a-warn'; label = 'degraded'; }
-        if (s.last_error) { dot = 'a-bad'; label = s.last_error; }
-        if (!s.oauth_configured) { label = 'not configured'; }
-        const canLogin = Boolean(s.oauth_configured) && !Boolean(s.has_token);
-        const loginBtn = canLogin ? '<button class="raw-btn" data-server="' + escAttrHtml(s.server) + '" onclick="startOauth(this.getAttribute(&#39;data-server&#39;))">login</button>' : '';
-        h += '<div class="a-item"><span><span class="a-dot ' + dot + '"></span>' + esc(s.server) + '</span><span class="a-right"><span style="color:var(--text-3)">' + esc(label) + '</span>' + loginBtn + '</span></div>';
-      }
-      v.innerHTML = h;
-    }
-
-    function escAttrHtml(value) {
-      return String(value)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
     }
 
     async function startOauth(server) {
@@ -920,51 +977,54 @@ async fn root() -> Html<&'static str> {
       });
     }
 
+    async function refreshOauth(server) {
+      await runAction('refresh oauth', async function() {
+        await postJson('/auth/refresh', { server: server });
+      });
+    }
+
     async function refresh(options) {
       options = options || {};
       const forceTools = Boolean(options.forceTools);
       if (refreshInFlight) return;
       refreshInFlight = true;
       try {
+        captureEditingDraftFromDom();
+        const refreshToolsNow = shouldRefreshTools(forceTools);
         const [statusPayload, serversPayload, logsPayload, authPayload] = await Promise.all([
           fetchJson('/status', 'status'),
           fetchJson('/servers', 'servers'),
           fetchJson('/logs?limit=200', 'logs'),
           fetchJson('/auth/status', 'auth/status')
         ]);
-        if (shouldRefreshTools(forceTools)) {
-          panelState.toolsPayload = await fetchJson('/tools', 'tools');
-          panelState.toolsRefreshAtMs = Date.now();
+        if (refreshToolsNow) {
+          state.toolsPayload = await fetchJson('/tools', 'tools');
+          state.toolsRefreshAtMs = Date.now();
         }
-        currentServers = serversPayload.servers || [];
-        panelState.serverPolicyModes = serversPayload.server_tool_policy_modes || {};
+        state.currentServers = serversPayload.servers || [];
+        state.serverPolicyModes = serversPayload.server_tool_policy_modes || {};
+        state.descriptionOverrides = serversPayload.tool_description_overrides || {};
+        state.authStatuses = authPayload.statuses || [];
         document.getElementById('status').textContent = JSON.stringify(statusPayload, null, 2);
-        document.getElementById('tools').textContent = JSON.stringify(panelState.toolsPayload || {}, null, 2);
-        document.getElementById('servers').textContent = JSON.stringify(currentServers, null, 2);
-        document.getElementById('policies').textContent = JSON.stringify({
+        document.getElementById('tools-raw').textContent = JSON.stringify(state.toolsPayload || {}, null, 2);
+        document.getElementById('servers-raw').textContent = JSON.stringify({
+          servers: state.currentServers,
           server_tool_policy_modes: serversPayload.server_tool_policy_modes || {},
+          tool_description_overrides: state.descriptionOverrides,
           tool_policy_overrides: serversPayload.tool_policy_overrides || {}
         }, null, 2);
-        document.getElementById('overrides').textContent = JSON.stringify(serversPayload.tool_description_overrides || {}, null, 2);
+        document.getElementById('logs-raw').textContent = JSON.stringify(logsPayload || {}, null, 2);
         document.getElementById('logs').textContent = (logsPayload.logs || []).join('\n');
-        document.getElementById('auth').textContent = JSON.stringify(authPayload, null, 2);
 
         renderStatusBar(statusPayload);
-        renderServersView(currentServers);
-        renderToolsView(panelState.toolsPayload);
-        renderPoliciesView(panelState.toolsPayload, serversPayload);
-        renderOverridesView(serversPayload.tool_description_overrides || {});
-        renderAuthView(authPayload);
-
-        setServerOptions('server-remove-name', currentServers);
-        setServerOptions('server-exposure-name', currentServers);
-        setServerOptions('policy-server-mode-name', currentServers);
-        setServerOptions('policy-override-server', currentServers);
-        setServerOptions('policy-override-remove-server', currentServers);
-        setServerOptions('override-server', currentServers);
-        setServerOptions('override-remove-server', currentServers);
-        setMutationFormState();
-        syncSelectedServerPolicyMode();
+        renderStatusStrip();
+        renderServersView();
+        renderToolFilters();
+        if (state.editingToolKey && !forceTools && !refreshToolsNow) {
+          captureEditingDraftFromDom();
+        } else {
+          renderToolsView();
+        }
       } catch (error) {
         setError('refresh failed: ' + (error instanceof Error ? error.message : String(error)));
       } finally {
@@ -984,10 +1044,6 @@ async fn root() -> Html<&'static str> {
       }
     }
 
-    async function saveToolPolicyOverride(server, tool, level) {
-      await postJson('/tool-policies', { server: server, tool: tool, level: level });
-    }
-
     async function deletePath(path) {
       const response = await fetch(path, { method: 'DELETE' });
       if (!response.ok) {
@@ -1005,6 +1061,141 @@ async fn root() -> Html<&'static str> {
       }
     }
 
+    document.querySelector('.tabs').addEventListener('click', function(event) {
+      const target = event.target instanceof Element ? event.target.closest('[data-tab]') : null;
+      if (!target) return;
+      event.preventDefault();
+      const tab = target.getAttribute('data-tab');
+      if (tab) setActiveTab(tab);
+    });
+
+    document.body.addEventListener('click', async function(event) {
+      const target = event.target instanceof Element ? event.target.closest('[data-action], [data-raw-toggle]') : null;
+      if (!target) return;
+
+      const rawToggle = target.getAttribute('data-raw-toggle');
+      if (rawToggle) {
+        toggleRaw(rawToggle);
+        return;
+      }
+
+      const action = target.getAttribute('data-action');
+      if (!action) return;
+      const server = target.getAttribute('data-server') || '';
+      const tool = target.getAttribute('data-tool') || '';
+
+      if (action === 'status-login' || action === 'server-login') {
+        await startOauth(server);
+        await refresh({ forceTools: true });
+        return;
+      }
+      if (action === 'status-refresh' || action === 'server-refresh') {
+        await refreshOauth(server);
+        await refresh({ forceTools: true });
+        return;
+      }
+      if (action === 'toggle-server') {
+        const enabled = target.getAttribute('data-enabled') === 'true';
+        await runAction('toggle server enabled state', async function() {
+          await postJson('/servers/' + encodeURIComponent(server) + '/enabled', { enabled: !enabled });
+          await refresh({ forceTools: true });
+        });
+        return;
+      }
+      if (action === 'remove-server') {
+        if (state.confirmRemoveServer !== server) {
+          state.confirmRemoveServer = server;
+          renderServersView();
+          if (clearRemoveConfirmTimer) clearTimeout(clearRemoveConfirmTimer);
+          clearRemoveConfirmTimer = setTimeout(function() {
+            state.confirmRemoveServer = null;
+            renderServersView();
+          }, 3000);
+          return;
+        }
+        await runAction('remove server', async function() {
+          await deletePath('/servers/' + encodeURIComponent(server));
+          state.confirmRemoveServer = null;
+          await refresh({ forceTools: true });
+        });
+        return;
+      }
+      if (action === 'set-policy') {
+        const level = target.getAttribute('data-level') || 'safe';
+        await runAction('set tool policy', async function() {
+          await postJson('/tool-policies', { server: server, tool: tool, level: level });
+          await refresh({ forceTools: true });
+        });
+        return;
+      }
+      if (action === 'edit-desc') {
+        const key = target.getAttribute('data-key') || '';
+        state.editingToolKey = key;
+        const selected = filteredToolDetails().find(function(detail) {
+          return toolKey(detail.server, detail.upstream_name || (detail.name || '').split(':').pop()) === key;
+        });
+        state.editingDraft = selected ? (selected.description || '') : '';
+        state.showDiff = false;
+        renderToolsView();
+        return;
+      }
+      if (action === 'cancel-desc') {
+        state.editingToolKey = null;
+        state.editingDraft = '';
+        state.showDiff = false;
+        renderToolsView();
+        return;
+      }
+      if (action === 'toggle-diff') {
+        state.showDiff = !state.showDiff;
+        renderToolsView();
+        return;
+      }
+      if (action === 'save-desc') {
+        const textarea = document.getElementById('edit-desc-text');
+        const description = textarea ? textarea.value : state.editingDraft;
+        await runAction('save description override', async function() {
+          await postJson('/tool-descriptions', { server: server, tool: tool, description: description });
+          state.editingToolKey = null;
+          state.editingDraft = '';
+          state.showDiff = false;
+          await refresh({ forceTools: true });
+        });
+        return;
+      }
+      if (action === 'restore-desc') {
+        await runAction('restore description override', async function() {
+          await postJson('/tool-descriptions/remove', { server: server, tool: tool });
+          state.editingToolKey = null;
+          state.editingDraft = '';
+          state.showDiff = false;
+          await refresh({ forceTools: true });
+        });
+        return;
+      }
+    });
+
+    document.getElementById('servers-view').addEventListener('change', async function(event) {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.classList.contains('server-exposure-select')) {
+        const server = target.getAttribute('data-server') || '';
+        const value = target.value;
+        await runAction('set exposure mode', async function() {
+          await postJson('/servers/' + encodeURIComponent(server) + '/exposure', { exposure_mode: value });
+          await refresh({ forceTools: true });
+        });
+      }
+      if (target.classList.contains('server-policy-select')) {
+        const server = target.getAttribute('data-server') || '';
+        const value = target.value;
+        await runAction('set catalog policy mode', async function() {
+          await postJson('/servers/' + encodeURIComponent(server) + '/policy', { policy_mode: value });
+          await refresh({ forceTools: true });
+        });
+      }
+    });
+
     document.getElementById('server-add-form').addEventListener('submit', async function(event) {
       event.preventDefault();
       await runAction('add server', async function() {
@@ -1019,142 +1210,39 @@ async fn root() -> Html<&'static str> {
       });
     });
 
-    document.getElementById('server-exposure-form').addEventListener('submit', async function(event) {
-      event.preventDefault();
-      await runAction('set exposure mode', async function() {
-        const name = document.getElementById('server-exposure-name').value;
-        if (!name) {
-          throw new Error('no server selected');
-        }
-        await postJson('/servers/' + encodeURIComponent(name) + '/exposure', {
-          exposure_mode: document.getElementById('server-exposure-mode').value
-        });
-        await refresh({ forceTools: true });
-      });
+    document.getElementById('tool-filter-text').addEventListener('input', function(event) {
+      state.filterText = event.target.value || '';
+      renderToolsView();
     });
 
-    document.getElementById('policy-server-mode-name').addEventListener('change', function() {
-      syncSelectedServerPolicyMode();
+    document.body.addEventListener('input', function(event) {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.id !== 'edit-desc-text') return;
+      state.editingDraft = target.value || '';
     });
 
-    document.getElementById('policies-view').addEventListener('click', async function(event) {
-      const rawTarget = event.target;
-      if (!(rawTarget instanceof Element)) return;
-      const target = rawTarget.closest('button[data-action]');
-      if (!target) return;
-      event.preventDefault();
-
-      const action = target.getAttribute('data-action');
-      const server = target.getAttribute('data-server') || '';
-      const tool = target.getAttribute('data-tool') || '';
-      const level = target.getAttribute('data-level') || '';
-      if (!server || !tool) return;
-
-      target.disabled = true;
-      try {
-        if (action === 'toggle-policy-level') {
-          const nextLevel = level === 'safe' ? 'escalated' : 'safe';
-          await runAction('save policy override', async function() {
-            await saveToolPolicyOverride(server, tool, nextLevel);
-            await refresh({ forceTools: true });
-          });
-          return;
-        }
-      } finally {
-        target.disabled = false;
-      }
+    document.getElementById('tool-filter-server').addEventListener('change', function(event) {
+      state.filterServer = event.target.value || 'all';
+      renderToolsView();
     });
 
-    document.getElementById('server-policy-mode-form').addEventListener('submit', async function(event) {
-      event.preventDefault();
-      await runAction('set catalog policy mode', async function() {
-        const name = document.getElementById('policy-server-mode-name').value;
-        if (!name) {
-          throw new Error('no server selected');
-        }
-        await postJson('/servers/' + encodeURIComponent(name) + '/policy', {
-          policy_mode: document.getElementById('policy-server-mode').value
-        });
-        await refresh({ forceTools: true });
-      });
+    document.getElementById('tool-filter-policy').addEventListener('change', function(event) {
+      state.filterPolicy = event.target.value || 'all';
+      renderToolsView();
     });
 
-    document.getElementById('server-remove-form').addEventListener('submit', async function(event) {
-      event.preventDefault();
-      await runAction('remove server', async function() {
-        const name = document.getElementById('server-remove-name').value;
-        if (!name) {
-          throw new Error('no server selected');
-        }
-        await deletePath('/servers/' + encodeURIComponent(name));
-        await refresh({ forceTools: true });
-      });
+    document.getElementById('tool-filter-reset').addEventListener('click', function() {
+      state.filterText = '';
+      state.filterServer = 'all';
+      state.filterPolicy = 'all';
+      renderToolFilters();
+      renderToolsView();
     });
 
-    document.getElementById('policy-override-set-form').addEventListener('submit', async function(event) {
-      event.preventDefault();
-      await runAction('save policy override', async function() {
-        const server = document.getElementById('policy-override-server').value;
-        if (!server) {
-          throw new Error('no server selected');
-        }
-        await postJson('/tool-policies', {
-          server: server,
-          tool: document.getElementById('policy-override-tool').value,
-          level: document.getElementById('policy-override-level').value
-        });
-        event.target.reset();
-        await refresh({ forceTools: true });
-      });
-    });
-
-    document.getElementById('policy-override-remove-form').addEventListener('submit', async function(event) {
-      event.preventDefault();
-      await runAction('remove policy override', async function() {
-        const server = document.getElementById('policy-override-remove-server').value;
-        if (!server) {
-          throw new Error('no server selected');
-        }
-        await postJson('/tool-policies/remove', {
-          server: server,
-          tool: document.getElementById('policy-override-remove-tool').value
-        });
-        event.target.reset();
-        await refresh({ forceTools: true });
-      });
-    });
-
-    document.getElementById('override-set-form').addEventListener('submit', async function(event) {
-      event.preventDefault();
-      await runAction('save override', async function() {
-        const server = document.getElementById('override-server').value;
-        if (!server) {
-          throw new Error('no server selected');
-        }
-        await postJson('/tool-descriptions', {
-          server: server,
-          tool: document.getElementById('override-tool').value,
-          description: document.getElementById('override-description').value
-        });
-        event.target.reset();
-        await refresh({ forceTools: true });
-      });
-    });
-
-    document.getElementById('override-remove-form').addEventListener('submit', async function(event) {
-      event.preventDefault();
-      await runAction('remove override', async function() {
-        const server = document.getElementById('override-remove-server').value;
-        if (!server) {
-          throw new Error('no server selected');
-        }
-        await postJson('/tool-descriptions/remove', {
-          server: server,
-          tool: document.getElementById('override-remove-tool').value
-        });
-        event.target.reset();
-        await refresh({ forceTools: true });
-      });
+    setActiveTab(readHashTab());
+    window.addEventListener('hashchange', function() {
+      setActiveTab(readHashTab());
     });
 
     void refresh({ forceTools: true });
@@ -1215,6 +1303,7 @@ async fn add_server(
         oauth: request.oauth,
         transport: request.transport,
         exposure_mode: request.exposure_mode,
+        enabled: request.enabled,
     };
     state
         .store
@@ -1304,6 +1393,33 @@ async fn update_server_tool_policy(
             );
             ApiError::bad_request(format!("failed to update policy mode: {err}"))
         })?;
+    state.upstream.invalidate_discovery_cache().await;
+    Ok(Json(MutationResponse { status: "ok" }))
+}
+
+async fn update_server_enabled(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(request): Json<UpdateServerEnabledRequest>,
+) -> Result<Json<MutationResponse>, ApiError> {
+    let target_name = name.clone();
+    let enabled = request.enabled;
+    state
+        .store
+        .update_async(move |cfg| cfg.set_server_enabled(&target_name, enabled))
+        .await
+        .map_err(|err| {
+            error!(
+                error = %err,
+                server = %name,
+                enabled,
+                "failed to update server enabled state"
+            );
+            ApiError::bad_request(format!("failed to update server enabled state: {err}"))
+        })?;
+    if !enabled {
+        state.upstream.evict_server(&name).await;
+    }
     state.upstream.invalidate_discovery_cache().await;
     Ok(Json(MutationResponse { status: "ok" }))
 }
@@ -1418,15 +1534,45 @@ async fn remove_tool_policy_override(
 
 async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, ApiError> {
     let cfg = load_config(&state).await?;
+    let enabled_servers = cfg.enabled_servers();
     let auth_headers = load_upstream_auth_headers(&state).await?;
     let discovery = state
         .upstream
-        .discover_tools_from_servers(&cfg.servers, &auth_headers)
+        .discover_tools_from_servers(&enabled_servers, &auth_headers)
         .await
         .map_err(|err| {
             error!(error = %err, "failed to discover upstream tools for tools request");
             ApiError::internal("failed to discover upstream tools")
         })?;
+
+    let failed_servers = discovery
+        .failures
+        .iter()
+        .map(|failure| failure.server_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let healthy_servers = enabled_servers
+        .iter()
+        .map(|server| server.name.clone())
+        .filter(|server_name| !failed_servers.contains(server_name))
+        .collect::<Vec<_>>();
+    if !healthy_servers.is_empty() {
+        match state.auth.mark_servers_healthy(&healthy_servers).await {
+            Ok(cleared) => {
+                if cleared > 0 {
+                    info!(
+                        cleared_server_count = cleared,
+                        "cleared stale oauth degraded state after successful upstream discovery"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to clear oauth degraded state after successful upstream discovery"
+                );
+            }
+        }
+    }
 
     // If an HTTP upstream says "auth required" and we don't have a client_id yet, attempt
     // MCP-spec OAuth discovery + RFC 7591 dynamic client registration in the background.
@@ -1436,8 +1582,7 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
         }
         let should_try_refresh = looks_like_invalid_token(&failure.message)
             || looks_like_initialize_decode_auth_failure(&failure.message);
-        let is_http = cfg
-            .servers
+        let is_http = enabled_servers
             .iter()
             .find(|server| server.name == failure.server_name)
             .is_some_and(|server| {
@@ -1487,16 +1632,18 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
 
     let mut tool_details = BTreeMap::<String, ToolDetail>::new();
     for tool in &discovery.tools {
-        let description = cfg
-            .tool_description_override_for(&tool.server_name, &tool.upstream_name)
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                tool.tool
-                    .description
-                    .as_ref()
-                    .map(|value| value.to_string())
-            })
+        let upstream_description = tool
+            .tool
+            .description
+            .as_ref()
+            .map(|value| value.to_string())
             .unwrap_or_default();
+        let override_description = cfg
+            .tool_description_override_for(&tool.server_name, &tool.upstream_name)
+            .map(ToOwned::to_owned);
+        let description = override_description
+            .clone()
+            .unwrap_or_else(|| upstream_description.clone());
         let policy = cfg.evaluate_tool_policy(
             &tool.server_name,
             &tool.upstream_name,
@@ -1507,6 +1654,9 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
             ToolDetail {
                 name: tool.namespaced_name.clone(),
                 description,
+                original_description: override_description
+                    .as_ref()
+                    .map(|_| upstream_description.clone()),
                 server: Some(tool.server_name.clone()),
                 upstream_name: Some(tool.upstream_name.clone()),
                 policy_level: policy.level.as_str().to_string(),
@@ -1520,6 +1670,7 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
         ToolDetail {
             name: "gambi_list_servers".to_string(),
             description: "List configured upstream servers".to_string(),
+            original_description: None,
             server: None,
             upstream_name: None,
             policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
@@ -1532,6 +1683,7 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
             name: "gambi_list_upstream_tools".to_string(),
             description: "Discover upstream tool names and discovery failures for troubleshooting"
                 .to_string(),
+            original_description: None,
             server: None,
             upstream_name: None,
             policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
@@ -1545,6 +1697,7 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
             description:
                 "Explain upstream MCP capabilities and return full tool metadata on demand (execute-only workflow)"
                     .to_string(),
+            original_description: None,
             server: None,
             upstream_name: None,
             policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
@@ -1559,6 +1712,7 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
                 description:
                     "Safe execution path with policy-aware tool-call bridge; escalated calls are blocked with ESCALATION_REQUIRED"
                         .to_string(),
+                original_description: None,
                 server: None,
                 upstream_name: None,
                 policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
@@ -1572,6 +1726,7 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
                 description:
                     "Escalated execution path for workflows that require non-safe upstream tools"
                         .to_string(),
+                original_description: None,
                 server: None,
                 upstream_name: None,
                 policy_level: ToolPolicyLevel::Escalated.as_str().to_string(),

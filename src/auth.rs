@@ -401,6 +401,42 @@ impl AuthManager {
         }
     }
 
+    pub async fn mark_servers_healthy(&self, server_names: &[String]) -> Result<usize> {
+        if server_names.is_empty() {
+            return Ok(0);
+        }
+
+        let server_set = server_names.iter().cloned().collect::<HashSet<_>>();
+        let cleared = self
+            .store
+            .update_tokens_async::<TokenState, _, _>(move |tokens| {
+                let mut changed = 0usize;
+                for (server_name, state) in &mut tokens.oauth_health {
+                    if !server_set.contains(server_name) {
+                        continue;
+                    }
+                    if state.degraded
+                        || state.last_error.is_some()
+                        || state.next_retry_after_epoch_seconds.is_some()
+                    {
+                        state.degraded = false;
+                        state.last_error = None;
+                        state.updated_at_epoch_seconds = Some(now_epoch_seconds());
+                        state.next_retry_after_epoch_seconds = None;
+                        changed = changed.saturating_add(1);
+                    }
+                }
+                Ok(changed)
+            })
+            .await?;
+
+        for server_name in server_names {
+            self.clear_retry_state(server_name);
+        }
+
+        Ok(cleared)
+    }
+
     pub async fn prune_orphaned_state(&self) -> Result<usize> {
         let cfg = self.store.load_async().await?;
         let server_names = cfg
@@ -435,7 +471,11 @@ impl AuthManager {
         let tokens: TokenState = self.store.load_tokens_async().await?;
         let now = now_epoch_seconds();
 
-        for server in cfg.servers.into_iter().filter(|item| item.oauth.is_some()) {
+        for server in cfg
+            .servers
+            .into_iter()
+            .filter(|item| item.enabled && item.oauth.is_some())
+        {
             let Some(token) = tokens.oauth_tokens.get(&server.name) else {
                 continue;
             };
@@ -1104,6 +1144,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mark_servers_healthy_clears_stale_degraded_state() {
+        let (_temp, store) = configured_store(None);
+        store
+            .update_tokens::<TokenState, _, _>(|tokens| {
+                tokens.oauth_health.insert(
+                    "port".to_string(),
+                    OAuthServerHealth {
+                        degraded: true,
+                        last_error: Some("oauth refresh returned error response".to_string()),
+                        updated_at_epoch_seconds: Some(1),
+                        next_retry_after_epoch_seconds: Some(2),
+                    },
+                );
+                Ok(())
+            })
+            .expect("seed degraded oauth health state");
+
+        let manager = AuthManager::new(store);
+        let cleared = manager
+            .mark_servers_healthy(&["port".to_string()])
+            .await
+            .expect("mark healthy should succeed");
+        assert_eq!(cleared, 1);
+
+        let statuses = manager.list_statuses().await.expect("status should load");
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].degraded);
+        assert!(statuses[0].last_error.is_none());
+    }
+
+    #[tokio::test]
     async fn callback_and_refresh_rotate_tokens_with_simulated_provider() {
         let (token_url, handle) = spawn_token_server().await;
 
@@ -1245,6 +1316,7 @@ mod tests {
                 oauth: Some(oauth),
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             }],
             server_tool_policy_modes: std::collections::BTreeMap::new(),
             tool_description_overrides: std::collections::BTreeMap::new(),
@@ -1269,6 +1341,7 @@ mod tests {
                     oauth: None,
                     transport: Default::default(),
                     exposure_mode: Default::default(),
+                    enabled: true,
                 }],
                 server_tool_policy_modes: std::collections::BTreeMap::new(),
                 tool_description_overrides: std::collections::BTreeMap::new(),
@@ -1316,6 +1389,7 @@ mod tests {
                     oauth: None,
                     transport: Default::default(),
                     exposure_mode: Default::default(),
+                    enabled: true,
                 }],
                 server_tool_policy_modes: std::collections::BTreeMap::new(),
                 tool_description_overrides: std::collections::BTreeMap::new(),

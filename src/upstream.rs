@@ -856,6 +856,10 @@ impl UpstreamManager {
         }
     }
 
+    pub async fn evict_server(&self, server_name: &str) {
+        self.evict_client(server_name).await;
+    }
+
     async fn register_progress_forwarder(
         &self,
         client: &ManagedUpstreamClient,
@@ -1644,6 +1648,7 @@ mod tests {
             oauth: None,
             transport: Default::default(),
             exposure_mode: Default::default(),
+            enabled: true,
         };
 
         let parsed = parse_upstream_target(&server).expect("parse should succeed");

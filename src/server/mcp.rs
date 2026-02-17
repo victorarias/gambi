@@ -40,6 +40,7 @@ struct ListedServer {
     url: String,
     exposure_mode: String,
     policy_mode: String,
+    enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -502,7 +503,8 @@ async fn merged_list_prompts(
             None,
         )
     })?;
-    let discovered = discover_prompts_with_auto_refresh(store, upstream_manager, &cfg.servers)
+    let enabled_servers = cfg.enabled_servers();
+    let discovered = discover_prompts_with_auto_refresh(store, upstream_manager, &enabled_servers)
         .await
         .map_err(|err| {
             McpError::internal_error(
@@ -551,14 +553,16 @@ async fn merged_list_resources(
             None,
         )
     })?;
-    let discovered = discover_resources_with_auto_refresh(store, upstream_manager, &cfg.servers)
-        .await
-        .map_err(|err| {
-            McpError::internal_error(
-                format!("failed to discover upstream resources: {err:#}"),
-                None,
-            )
-        })?;
+    let enabled_servers = cfg.enabled_servers();
+    let discovered =
+        discover_resources_with_auto_refresh(store, upstream_manager, &enabled_servers)
+            .await
+            .map_err(|err| {
+                McpError::internal_error(
+                    format!("failed to discover upstream resources: {err:#}"),
+                    None,
+                )
+            })?;
 
     for failure in discovered.failures {
         warn!(
@@ -600,14 +604,16 @@ async fn merged_list_resource_templates(
             None,
         )
     })?;
-    let discovered = discover_resources_with_auto_refresh(store, upstream_manager, &cfg.servers)
-        .await
-        .map_err(|err| {
-            McpError::internal_error(
-                format!("failed to discover upstream resource templates: {err:#}"),
-                None,
-            )
-        })?;
+    let enabled_servers = cfg.enabled_servers();
+    let discovered =
+        discover_resources_with_auto_refresh(store, upstream_manager, &enabled_servers)
+            .await
+            .map_err(|err| {
+                McpError::internal_error(
+                    format!("failed to discover upstream resource templates: {err:#}"),
+                    None,
+                )
+            })?;
 
     for failure in discovered.failures {
         warn!(
@@ -693,6 +699,12 @@ async fn route_get_prompt(
             None,
         ));
     };
+    if !server.enabled {
+        return Err(McpError::invalid_params(
+            format!("server '{server_name}' is disabled"),
+            None,
+        ));
+    }
 
     let mut upstream_request = request;
     upstream_request.name = upstream_prompt_name.clone();
@@ -775,6 +787,12 @@ async fn route_read_resource(
             None,
         ));
     };
+    if !server.enabled {
+        return Err(McpError::invalid_params(
+            format!("server '{server_name}' is disabled"),
+            None,
+        ));
+    }
 
     let mut upstream_request = request;
     upstream_request.uri = upstream_uri.clone();
@@ -989,6 +1007,7 @@ async fn list_servers_output(store: &ConfigStore) -> Result<Json<ListServersOutp
                 url: server.url,
                 exposure_mode: server.exposure_mode.as_str().to_string(),
                 policy_mode,
+                enabled: server.enabled,
             }
         })
         .collect();
@@ -1001,7 +1020,8 @@ async fn list_upstream_tools_output(
     upstream_manager: &upstream::UpstreamManager,
 ) -> Result<Json<UpstreamDiscoveryOutput>, String> {
     let cfg = store.load_async().await.map_err(|err| err.to_string())?;
-    let discovered = discover_tools_with_auto_refresh(store, upstream_manager, &cfg.servers)
+    let enabled_servers = cfg.enabled_servers();
+    let discovered = discover_tools_with_auto_refresh(store, upstream_manager, &enabled_servers)
         .await
         .map_err(|err| err.to_string())?;
 
@@ -1120,10 +1140,13 @@ fn select_help_servers(
     cfg: &crate::config::AppConfig,
     selected_server_name: Option<&str>,
 ) -> Result<Vec<crate::config::ServerConfig>, String> {
-    let mut servers = cfg.servers.clone();
+    let mut servers = cfg.enabled_servers();
     if let Some(server_name) = selected_server_name {
         servers.retain(|server| server.name == server_name);
         if servers.is_empty() {
+            if cfg.servers.iter().any(|server| server.name == server_name) {
+                return Err(format!("server '{server_name}' is disabled"));
+            }
             return Err(format!("unknown server '{server_name}'"));
         }
     }

@@ -297,6 +297,11 @@ async fn handle_tool_call(
             "unknown tool namespace '{server_name}'"
         )));
     };
+    if !server.enabled {
+        return Err(ExecutionError::Message(format!(
+            "server '{server_name}' is disabled"
+        )));
+    }
     if runtime.policy == ExecutionPolicy::Safe {
         let description = runtime
             .tool_descriptions
@@ -470,8 +475,9 @@ async fn build_tool_description_index(
     auth_headers: &UpstreamAuthHeaders,
 ) -> HashMap<(String, String), String> {
     let mut descriptions = HashMap::new();
+    let enabled_servers = cfg.enabled_servers();
     let Ok(discovered) = upstream
-        .discover_tools_from_servers(&cfg.servers, auth_headers)
+        .discover_tools_from_servers(&enabled_servers, auth_headers)
         .await
     else {
         return descriptions;
@@ -954,6 +960,7 @@ mod tests {
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             }],
         )
         .expect("rewrite should succeed");
@@ -971,6 +978,7 @@ mod tests {
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             }],
         )
         .expect("script build should succeed");
@@ -1005,6 +1013,7 @@ result = fixture.fixture_echo(value=3)
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             }],
         )
         .expect("rewrite should succeed");
@@ -1038,6 +1047,7 @@ return fixture.fixture_echo(value=2)
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             }],
         )
         .expect("rewrite should succeed");
@@ -1062,6 +1072,7 @@ return fixture.fixture_echo(value=2)
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             }],
         )
         .expect("rewrite should succeed");
@@ -1105,6 +1116,7 @@ return fixture.fixture_echo(value=3)
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             }],
         )
         .expect("rewrite should succeed");
@@ -1124,6 +1136,7 @@ return fixture.fixture_echo(value=3)
                 oauth: None,
                 transport: Default::default(),
                 exposure_mode: Default::default(),
+                enabled: true,
             }],
         )
         .expect("rewrite should succeed");
