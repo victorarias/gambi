@@ -18,11 +18,12 @@ That kind of duct-tape-and-ingenuity solution has a name in Brazilian Portuguese
 
 ## What it does
 
-- **Single MCP connection** — your agent talks to one stdio server and sees all upstream tools, namespaced (`github:search_issues`, `slack:post_message`)
+- **Single MCP connection** — your agent talks to one stdio server and gets a stable gambi surface (`gambi_help`, `gambi_execute`, etc.)
 - **Aggregation** — tools, prompts, and resources from every upstream server, with automatic namespacing and routing
 - **`gambi_execute` + `gambi_execute_escalated`** — safe-first execution with explicit escalation when workflows need higher-risk tools
 - **Admin UI** — web dashboard with three tabs (Servers, Tools, Logs) plus a status strip of per-server health chips; add/remove servers, activate/deactivate them, change exposure and policy via inline selectors, edit tool descriptions, and monitor logs
 - **Activation controls** — deactivate a server without deleting config; reactivate with one click
+- **Tool activation controls** — per-server tool default (`all` or `none`) plus per-tool active/inactive toggles
 - **Exposure modes** — control how much tool metadata your agent sees: `passthrough`, `compact`, `names-only`, or `server-only`
 - **Execution policy controls** — classify each server catalog as `heuristic`, `all-safe`, `all-escalated`, or `custom`; each tool shows a `safe`/`escalated` badge and a policy-source pill (`heuristic`, `override`, `system`)
 - **OAuth handling** — PKCE, token refresh/rotation, degraded-state reporting — all managed for you
@@ -85,7 +86,10 @@ Or through the admin UI at `http://127.0.0.1:3333`.
 
 ### 3. Use it
 
-Your agent now sees all upstream tools prefixed with their server name. Ask it to call `github:search_issues` or `my-tool:do_something` — gambi routes the call to the right upstream server.
+Your agent uses gambi's execute-first flow:
+- `gambi_help` to inspect available upstream tools
+- `gambi_execute` for safe workflows
+- `gambi_execute_escalated` only when escalation is required
 
 For multi-step workflows, the agent can use `gambi_execute` (safe mode) to write a Python script that calls multiple tools in sequence:
 
@@ -146,15 +150,16 @@ The admin panel runs on loopback only (`http://127.0.0.1:3333`) and is organized
 
 **Status strip** — a row of per-server chips showing connection state at a glance (authenticated, disabled, degraded, not configured). Login/refresh buttons appear inline when a server needs attention.
 
-**Servers tab** — add servers by name + URL with exposure and policy selectors. Each server card shows:
-- Inline dropdowns to change exposure mode (`passthrough`, `compact`, `names-only`, `server-only`) and policy mode (`heuristic`, `all-safe`, `all-escalated`, `custom`)
+**Servers tab** — add servers by name + URL with exposure, policy, and tool-default selectors. Each server card shows:
+- Inline dropdowns to change exposure mode (`passthrough`, `compact`, `names-only`, `server-only`), policy mode (`heuristic`, `all-safe`, `all-escalated`, `custom`), and tool default (`all`, `none`)
 - Activate / Deactivate toggle to enable or disable a server without removing it
 - Remove button (requires double-click confirmation)
-- Auth status chip and a summary line (`state=enabled · exposure=passthrough · policy=heuristic`)
+- Auth status chip and a summary line (`state=enabled · exposure=passthrough · tools=all · policy=heuristic`)
 
 **Tools tab** — lists every tool your agent can access, with filters by name/description, server, and policy level. Each tool row shows:
+- `active` / `inactive` toggle for per-tool activation overrides
 - `safe` / `escalated` routing badges you can click to override the policy for that tool
-- A policy-source pill (`heuristic`, `override`, `catalog`, `system`) showing where the classification comes from
+- Source pill showing activation + policy source (`override`, `catalog-all`, `catalog-none`, `heuristic`, `system`)
 - Click-to-edit description: click the description text to open an inline editor with Save Override / Cancel buttons; when an override exists, a diff view and Restore button are available
 
 **Logs tab** — tails recent server activity.
@@ -171,6 +176,7 @@ gambi serve --admin-port 4000      # custom admin port
 gambi serve --no-exec              # disable both execution tools
 gambi add <name> <url>             # add upstream server
 gambi add <name> <url> --policy all-escalated
+gambi add <name> <url> --tool-default none
 gambi disable <name>               # deactivate server (keep config and auth state)
 gambi enable <name>                # reactivate server
 gambi remove <name>                # remove upstream server
@@ -184,7 +190,7 @@ Config directory: `~/.config/gambi/`
 
 | File | Purpose |
 |------|---------|
-| `config.json` | Servers, policy modes/overrides, and tool description overrides |
+| `config.json` | Servers, tool activation defaults/overrides, policy modes/overrides, and tool description overrides |
 | `tokens.json` | OAuth tokens (file-backed profiles) |
 
 Token storage profiles:

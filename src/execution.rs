@@ -302,6 +302,11 @@ async fn handle_tool_call(
             "server '{server_name}' is disabled"
         )));
     }
+    if !runtime.cfg.is_tool_enabled(server_name, upstream_tool_name) {
+        return Err(ExecutionError::Message(format!(
+            "tool '{namespaced_name}' is disabled in gambi admin"
+        )));
+    }
     if runtime.policy == ExecutionPolicy::Safe {
         let description = runtime
             .tool_descriptions
@@ -483,6 +488,9 @@ async fn build_tool_description_index(
         return descriptions;
     };
     for discovered_tool in discovered.tools {
+        if !cfg.is_tool_enabled(&discovered_tool.server_name, &discovered_tool.upstream_name) {
+            continue;
+        }
         let effective = cfg
             .tool_description_override_for(
                 &discovered_tool.server_name,

@@ -201,6 +201,34 @@ impl ToolPolicyMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolActivationMode {
+    #[default]
+    All,
+    None,
+}
+
+impl ToolActivationMode {
+    fn is_all(&self) -> bool {
+        *self == Self::All
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::None => "none",
+        }
+    }
+
+    pub fn default_enabled(self) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolPolicyLevel {
@@ -236,6 +264,29 @@ impl ToolPolicySource {
             Self::CatalogAllEscalated => "catalog-all-escalated",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolActivationSource {
+    CatalogAll,
+    CatalogNone,
+    Override,
+}
+
+impl ToolActivationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CatalogAll => "catalog-all",
+            Self::CatalogNone => "catalog-none",
+            Self::Override => "override",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolActivationDecision {
+    pub enabled: bool,
+    pub source: ToolActivationSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +329,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_tool_activation_modes: BTreeMap<String, ToolActivationMode>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_activation_overrides: BTreeMap<String, BTreeMap<String, bool>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub server_tool_policy_modes: BTreeMap<String, ToolPolicyMode>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_description_overrides: BTreeMap<String, BTreeMap<String, String>>,
@@ -314,6 +369,8 @@ impl AppConfig {
         self.servers.retain(|s| s.name != server_name);
         let removed = self.servers.len() != before;
         if removed {
+            self.server_tool_activation_modes.remove(server_name);
+            self.tool_activation_overrides.remove(server_name);
             self.server_tool_policy_modes.remove(server_name);
             self.tool_description_overrides.remove(server_name);
             self.tool_policy_overrides.remove(server_name);
@@ -355,6 +412,108 @@ impl AppConfig {
             .filter(|server| server.enabled)
             .cloned()
             .collect()
+    }
+
+    pub fn set_server_tool_activation_mode(
+        &mut self,
+        server_name: &str,
+        activation_mode: ToolActivationMode,
+    ) -> Result<()> {
+        if !self.servers.iter().any(|server| server.name == server_name) {
+            bail!("unknown server '{server_name}'");
+        }
+
+        if activation_mode.is_all() {
+            self.server_tool_activation_modes.remove(server_name);
+        } else {
+            self.server_tool_activation_modes
+                .insert(server_name.to_string(), activation_mode);
+        }
+        self.prune_tool_activation_overrides_for_server(server_name);
+        Ok(())
+    }
+
+    pub fn server_tool_activation_mode_for(&self, server_name: &str) -> ToolActivationMode {
+        self.server_tool_activation_modes
+            .get(server_name)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn set_tool_activation_override(
+        &mut self,
+        server_name: &str,
+        upstream_tool_name: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        if !self.servers.iter().any(|server| server.name == server_name) {
+            bail!("unknown server '{server_name}'");
+        }
+
+        let tool_name = upstream_tool_name.trim();
+        if tool_name.is_empty() {
+            bail!("tool name cannot be empty");
+        }
+
+        let default_enabled = self
+            .server_tool_activation_mode_for(server_name)
+            .default_enabled();
+        if enabled == default_enabled {
+            if let Some(overrides) = self.tool_activation_overrides.get_mut(server_name) {
+                overrides.remove(tool_name);
+                if overrides.is_empty() {
+                    self.tool_activation_overrides.remove(server_name);
+                }
+            }
+            return Ok(());
+        }
+
+        self.tool_activation_overrides
+            .entry(server_name.to_string())
+            .or_default()
+            .insert(tool_name.to_string(), enabled);
+        Ok(())
+    }
+
+    pub fn tool_activation_override_for(
+        &self,
+        server_name: &str,
+        upstream_tool_name: &str,
+    ) -> Option<bool> {
+        self.tool_activation_overrides
+            .get(server_name)
+            .and_then(|overrides| overrides.get(upstream_tool_name))
+            .copied()
+    }
+
+    pub fn evaluate_tool_activation(
+        &self,
+        server_name: &str,
+        upstream_tool_name: &str,
+    ) -> ToolActivationDecision {
+        if let Some(enabled) = self.tool_activation_override_for(server_name, upstream_tool_name) {
+            return ToolActivationDecision {
+                enabled,
+                source: ToolActivationSource::Override,
+            };
+        }
+
+        let mode = self.server_tool_activation_mode_for(server_name);
+        match mode {
+            ToolActivationMode::All => ToolActivationDecision {
+                enabled: true,
+                source: ToolActivationSource::CatalogAll,
+            },
+            ToolActivationMode::None => ToolActivationDecision {
+                enabled: false,
+                source: ToolActivationSource::CatalogNone,
+            },
+        }
+    }
+
+    pub fn is_tool_enabled(&self, server_name: &str, upstream_tool_name: &str) -> bool {
+        self.evaluate_tool_activation(server_name, upstream_tool_name)
+            .enabled
     }
 
     pub fn set_tool_description_override(
@@ -518,6 +677,19 @@ impl AppConfig {
             .map(String::as_str)
     }
 
+    fn prune_tool_activation_overrides_for_server(&mut self, server_name: &str) {
+        let default_enabled = self
+            .server_tool_activation_mode_for(server_name)
+            .default_enabled();
+        let Some(overrides) = self.tool_activation_overrides.get_mut(server_name) else {
+            return;
+        };
+        overrides.retain(|_, enabled| *enabled != default_enabled);
+        if overrides.is_empty() {
+            self.tool_activation_overrides.remove(server_name);
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for server in &self.servers {
@@ -557,6 +729,26 @@ impl AppConfig {
                 if description.trim().is_empty() {
                     bail!(
                         "tool description override for '{server_name}:{upstream_tool_name}' cannot be empty"
+                    );
+                }
+            }
+        }
+        for (server_name, mode) in &self.server_tool_activation_modes {
+            if !seen.contains(server_name) {
+                bail!("tool activation mode references unknown server '{server_name}'");
+            }
+            if mode.is_all() {
+                bail!("tool activation mode for '{server_name}' should omit all default");
+            }
+        }
+        for (server_name, overrides) in &self.tool_activation_overrides {
+            if !seen.contains(server_name) {
+                bail!("tool activation overrides reference unknown server '{server_name}'");
+            }
+            for upstream_tool_name in overrides.keys() {
+                if upstream_tool_name.trim().is_empty() {
+                    bail!(
+                        "tool activation override has empty tool name for server '{server_name}'"
                     );
                 }
             }
@@ -1235,7 +1427,8 @@ fn enforce_owner_only_directory_permissions(path: &Path) -> Result<()> {
 mod tests {
     use super::{
         AppConfig, ConfigStore, OAuthConfig, RuntimeProfile, ServerConfig, TokenStorage,
-        TokenStorePreference, ToolPolicyLevel, ToolPolicyMode, tool_matches_safe_heuristic,
+        TokenStorePreference, ToolActivationMode, ToolPolicyLevel, ToolPolicyMode,
+        tool_matches_safe_heuristic,
     };
     use std::collections::BTreeMap;
     #[cfg(unix)]
@@ -1488,6 +1681,41 @@ mod tests {
     }
 
     #[test]
+    fn tool_activation_modes_and_overrides_apply_and_prune() {
+        let mut cfg = AppConfig::default();
+        cfg.add_server(ServerConfig {
+            name: "atlassian".to_string(),
+            url: "https://example.com/mcp".to_string(),
+            oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
+            enabled: true,
+        })
+        .expect("valid server should be added");
+
+        assert!(cfg.is_tool_enabled("atlassian", "getJiraIssue"));
+
+        cfg.set_server_tool_activation_mode("atlassian", ToolActivationMode::None)
+            .expect("mode should be set");
+        assert!(!cfg.is_tool_enabled("atlassian", "getJiraIssue"));
+
+        cfg.set_tool_activation_override("atlassian", "getJiraIssue", true)
+            .expect("override should be set");
+        assert!(cfg.is_tool_enabled("atlassian", "getJiraIssue"));
+
+        cfg.set_tool_activation_override("atlassian", "getJiraIssue", false)
+            .expect("matching default should prune override");
+        assert!(
+            cfg.tool_activation_override_for("atlassian", "getJiraIssue")
+                .is_none()
+        );
+
+        assert!(cfg.remove_server("atlassian"));
+        assert!(cfg.server_tool_activation_modes.is_empty());
+        assert!(cfg.tool_activation_overrides.is_empty());
+    }
+
+    #[test]
     fn oauth_config_is_validated() {
         let mut cfg = AppConfig::default();
 
@@ -1595,6 +1823,8 @@ mod tests {
                 exposure_mode: Default::default(),
                 enabled: true,
             }],
+            server_tool_activation_modes: BTreeMap::new(),
+            tool_activation_overrides: BTreeMap::new(),
             server_tool_policy_modes: BTreeMap::new(),
             tool_description_overrides: BTreeMap::new(),
             tool_policy_overrides: BTreeMap::new(),
@@ -1674,6 +1904,8 @@ mod tests {
                 exposure_mode: Default::default(),
                 enabled: true,
             }],
+            server_tool_activation_modes: BTreeMap::new(),
+            tool_activation_overrides: BTreeMap::new(),
             server_tool_policy_modes: BTreeMap::new(),
             tool_description_overrides: BTreeMap::new(),
             tool_policy_overrides: BTreeMap::new(),

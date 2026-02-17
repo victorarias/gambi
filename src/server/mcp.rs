@@ -39,6 +39,7 @@ struct ListedServer {
     name: String,
     url: String,
     exposure_mode: String,
+    tool_default: String,
     policy_mode: String,
     enabled: bool,
 }
@@ -258,8 +259,9 @@ impl ServerHandler for McpServer {
              2. Call gambi_execute first (safe policy enforcement).\n\
              3. If safe mode returns ESCALATION_REQUIRED, call gambi_execute_escalated.\n\
              4. Safe heuristic marks tools as safe when name starts with get/list/search/lookup/fetch, or description starts with get.\n\
-             5. Direct namespaced upstream tool calls are disabled.\n\
-             6. If discovery is sparse, call gambi_list_upstream_tools for diagnostics."
+             5. Only tools marked active in gambi admin are available through help/execute.\n\
+             6. Direct namespaced upstream tool calls are disabled.\n\
+             7. If discovery is sparse, call gambi_list_upstream_tools for diagnostics."
         } else {
             "gambi execute-only mode with execution disabled (--no-exec):\n\
              Use gambi_help to inspect available upstream capabilities. Direct namespaced tool calls are disabled."
@@ -990,6 +992,7 @@ fn handle_waiter_result(
 
 async fn list_servers_output(store: &ConfigStore) -> Result<Json<ListServersOutput>, String> {
     let cfg = store.load_async().await.map_err(|err| err.to_string())?;
+    let activation_modes = cfg.server_tool_activation_modes.clone();
     let policy_modes = cfg.server_tool_policy_modes.clone();
     let servers = cfg
         .servers
@@ -1002,10 +1005,17 @@ async fn list_servers_output(store: &ConfigStore) -> Result<Json<ListServersOutp
                 .unwrap_or_default()
                 .as_str()
                 .to_string();
+            let tool_default = activation_modes
+                .get(&name)
+                .copied()
+                .unwrap_or_default()
+                .as_str()
+                .to_string();
             ListedServer {
                 name,
                 url: server.url,
                 exposure_mode: server.exposure_mode.as_str().to_string(),
+                tool_default,
                 policy_mode,
                 enabled: server.enabled,
             }
@@ -1024,9 +1034,9 @@ async fn list_upstream_tools_output(
     let discovered = discover_tools_with_auto_refresh(store, upstream_manager, &enabled_servers)
         .await
         .map_err(|err| err.to_string())?;
+    let tools = filter_enabled_discovered_tools(&cfg, discovered.tools);
 
-    let tools = discovered
-        .tools
+    let tools = tools
         .into_iter()
         .map(|tool| UpstreamToolOutput {
             namespaced_name: tool.namespaced_name,
@@ -1057,9 +1067,10 @@ async fn gambi_help_output(
     let discovery = discover_tools_with_auto_refresh(store, upstream_manager, &selected_servers)
         .await
         .map_err(|err| err.to_string())?;
+    let enabled_discovered = filter_enabled_discovered_tools(&cfg, discovery.tools);
 
     let mut by_server = BTreeMap::<String, Vec<upstream::DiscoveredTool>>::new();
-    for tool in discovery.tools {
+    for tool in enabled_discovered {
         by_server
             .entry(tool.server_name.clone())
             .or_default()
@@ -1125,6 +1136,7 @@ async fn gambi_help_output(
 3) Run workflows through gambi_execute first (safe policy mode).\n\
 4) If response includes ESCALATION_REQUIRED, re-run with gambi_execute_escalated.\n\
 5) Safe heuristic: names starting with get/list/search/lookup/fetch OR descriptions starting with get.\n\
+6) Only tools marked active in gambi admin are exposed.\n\
 Direct namespaced upstream tool calls are disabled."
         .to_string();
 
@@ -1200,6 +1212,7 @@ fn summarize_tools_for_exposure_mode(
 
     discovered
         .iter()
+        .filter(|tool| cfg.is_tool_enabled(&tool.server_name, &tool.upstream_name))
         .map(|tool| {
             let effective = effective_tool_description(cfg, tool);
             let policy = cfg.evaluate_tool_policy(
@@ -1222,6 +1235,16 @@ fn summarize_tools_for_exposure_mode(
                 policy_source: policy.source.as_str().to_string(),
             }
         })
+        .collect()
+}
+
+fn filter_enabled_discovered_tools(
+    cfg: &crate::config::AppConfig,
+    tools: Vec<upstream::DiscoveredTool>,
+) -> Vec<upstream::DiscoveredTool> {
+    tools
+        .into_iter()
+        .filter(|tool| cfg.is_tool_enabled(&tool.server_name, &tool.upstream_name))
         .collect()
 }
 

@@ -9,7 +9,8 @@ use serde::Deserialize;
 
 use crate::auth::{TokenState, prune_token_state_for_server_names};
 use crate::config::{
-    AppConfig, ConfigStore, ExposureMode, ServerConfig, ToolPolicyMode, TransportMode,
+    AppConfig, ConfigStore, ExposureMode, ServerConfig, ToolActivationMode, ToolPolicyMode,
+    TransportMode,
 };
 use crate::server;
 
@@ -69,6 +70,9 @@ struct AddArgs {
     /// Tool policy mode: heuristic|all-safe|all-escalated|custom.
     #[arg(long, default_value = "heuristic")]
     policy: String,
+    /// Tool default activation: all|none.
+    #[arg(long, default_value = "all")]
+    tool_default: String,
 }
 
 #[derive(Debug, Args)]
@@ -187,6 +191,20 @@ mod tests {
         assert!(debug.contains("policy: \"all-escalated\""));
     }
 
+    #[test]
+    fn parses_add_with_tool_default_mode() {
+        let cli = Cli::parse_from([
+            "gambi",
+            "add",
+            "atlassian",
+            "https://mcp.atlassian.com/v1/sse",
+            "--tool-default",
+            "none",
+        ]);
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("tool_default: \"none\""));
+    }
+
     #[tokio::test]
     async fn rejects_non_loopback_admin_host() {
         let cli = Cli::parse_from(["gambi", "serve", "--admin-host", "0.0.0.0"]);
@@ -213,6 +231,8 @@ mod tests {
                     exposure_mode: Default::default(),
                     enabled: true,
                 }],
+                server_tool_activation_modes: std::collections::BTreeMap::new(),
+                tool_activation_overrides: std::collections::BTreeMap::new(),
                 server_tool_policy_modes: std::collections::BTreeMap::new(),
                 tool_description_overrides: std::collections::BTreeMap::new(),
                 tool_policy_overrides: std::collections::BTreeMap::new(),
@@ -296,6 +316,7 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
             let transport = parse_transport_flag(&args.transport)?;
             let exposure_mode = parse_exposure_flag(&args.exposure)?;
             let policy_mode = parse_policy_flag(&args.policy)?;
+            let tool_activation_mode = parse_tool_default_flag(&args.tool_default)?;
             let server_name = args.name.clone();
             store.update(|cfg| {
                 cfg.add_server(ServerConfig {
@@ -306,7 +327,8 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
                     exposure_mode,
                     enabled: true,
                 })?;
-                cfg.set_server_tool_policy_mode(&server_name, policy_mode)
+                cfg.set_server_tool_policy_mode(&server_name, policy_mode)?;
+                cfg.set_server_tool_activation_mode(&server_name, tool_activation_mode)
             })?;
             println!("server added");
             Ok(())
@@ -347,10 +369,11 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
             for server in &cfg.servers {
                 let policy = cfg.server_tool_policy_mode_for(&server.name);
                 println!(
-                    "{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}",
                     server.name,
                     server.url,
                     server.exposure_mode.as_str(),
+                    cfg.server_tool_activation_mode_for(&server.name).as_str(),
                     policy.as_str(),
                     if server.enabled {
                         "enabled"
@@ -569,5 +592,13 @@ fn parse_policy_flag(raw: &str) -> Result<ToolPolicyMode> {
         other => {
             bail!("invalid policy '{other}', expected heuristic|all-safe|all-escalated|custom")
         }
+    }
+}
+
+fn parse_tool_default_flag(raw: &str) -> Result<ToolActivationMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "all" => Ok(ToolActivationMode::All),
+        "none" => Ok(ToolActivationMode::None),
+        other => bail!("invalid tool default '{other}', expected all|none"),
     }
 }

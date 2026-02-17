@@ -24,8 +24,8 @@ use tracing::{error, info, warn};
 
 use crate::auth::{AuthManager, AuthServerStatus, AuthStartResponse, TokenState};
 use crate::config::{
-    AppConfig, ConfigStore, ExposureMode, ServerConfig, ToolPolicyLevel, ToolPolicyMode,
-    ToolPolicySource,
+    AppConfig, ConfigStore, ExposureMode, ServerConfig, ToolActivationMode, ToolPolicyLevel,
+    ToolPolicyMode, ToolPolicySource,
 };
 use crate::logging;
 use crate::upstream;
@@ -81,6 +81,8 @@ struct StatusResponse {
 #[derive(Debug, Serialize)]
 struct ServersResponse {
     servers: Vec<ServerConfig>,
+    server_tool_activation_modes: BTreeMap<String, ToolActivationMode>,
+    tool_activation_overrides: BTreeMap<String, BTreeMap<String, bool>>,
     server_tool_policy_modes: BTreeMap<String, ToolPolicyMode>,
     tool_description_overrides: BTreeMap<String, BTreeMap<String, String>>,
     tool_policy_overrides: BTreeMap<String, BTreeMap<String, ToolPolicyLevel>>,
@@ -109,6 +111,8 @@ struct ToolDetail {
     server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     upstream_name: Option<String>,
+    enabled: bool,
+    activation_source: String,
     policy_level: String,
     policy_source: String,
 }
@@ -170,6 +174,11 @@ struct UpdateServerToolPolicyRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct UpdateServerToolActivationRequest {
+    tool_activation_mode: ToolActivationMode,
+}
+
+#[derive(Debug, Deserialize)]
 struct UpdateServerEnabledRequest {
     enabled: bool,
 }
@@ -190,7 +199,16 @@ struct AddServerRequest {
     exposure_mode: crate::config::ExposureMode,
     #[serde(default)]
     policy_mode: crate::config::ToolPolicyMode,
+    #[serde(default)]
+    tool_activation_mode: crate::config::ToolActivationMode,
     #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolActivationOverrideRequest {
+    server: String,
+    tool: String,
     enabled: bool,
 }
 
@@ -300,9 +318,14 @@ pub async fn run(
         .route("/servers", get(servers).post(add_server))
         .route("/servers/{name}/exposure", post(update_server_exposure))
         .route("/servers/{name}/policy", post(update_server_tool_policy))
+        .route(
+            "/servers/{name}/tool-default",
+            post(update_server_tool_activation),
+        )
         .route("/servers/{name}/enabled", post(update_server_enabled))
         .route("/servers/{name}", delete(remove_server))
         .route("/tools", get(tools))
+        .route("/tool-activation", post(set_tool_activation_override))
         .route("/tool-descriptions", post(set_tool_description_override))
         .route(
             "/tool-descriptions/remove",
@@ -370,14 +393,14 @@ async fn root() -> Html<&'static str> {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>gambi admin</title>
-  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23e8a642'/><text x='50' y='70' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='72' fill='%230c0c0e'>g</text></svg>">
+  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23d47a5a'/><text x='50' y='70' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='72' fill='%230e0b10'>g</text></svg>">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
-      --bg: #0d0e0f; --surface: #151617; --raised: #1d1e20;
-      --border: #28292c; --border-hi: #38393d;
-      --text: #d8d6d2; --text-2: #8a8b8e; --text-3: #555659;
-      --accent: #d4943a; --accent-bg: rgba(212,148,58,0.08);
+      --bg: #0e0b10; --surface: #161318; --raised: #1e1a22;
+      --border: #2a2630; --border-hi: #3b3544;
+      --text: #dbd5d0; --text-2: #8e868a; --text-3: #585058;
+      --accent: #d47a5a; --accent-bg: rgba(212,122,90,0.08);
       --green: #7abf8a; --red: #d46a6a; --red-bg: rgba(212,106,106,0.09);
       --mono: 'JetBrains Mono', 'Cascadia Code', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
       --sans: 'Avenir Next', 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
@@ -425,7 +448,7 @@ async fn root() -> Html<&'static str> {
     .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
     .tab-btn { font-family: var(--mono); font-size: 12px; padding: 7px 12px; border-radius: 100px; border: 1px dashed var(--border); background: var(--surface); color: var(--text-2); cursor: pointer; transition: border-color 0.15s, color 0.15s, background 0.15s; }
     .tab-btn:hover { border-color: var(--border-hi); color: var(--text); }
-    .tab-btn.active { border-color: rgba(212,148,58,0.5); color: var(--accent); background: var(--accent-bg); }
+    .tab-btn.active { border-color: rgba(212,122,90,0.5); color: var(--accent); background: var(--accent-bg); }
 
     .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); display: flex; flex-direction: column; min-height: 460px; position: relative; overflow: hidden; }
     .panel::before {
@@ -445,10 +468,10 @@ async fn root() -> Html<&'static str> {
     .hidden { display: none !important; }
 
     .raw-btn { font-family: var(--mono); font-size: 10px; padding: 1px 8px; border-radius: 100px; background: none; border: 1px dashed var(--border); color: var(--text-3); cursor: pointer; }
-    pre { font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--text-3); background: var(--bg); border-left: 2px solid rgba(212,148,58,0.14); padding: 10px 12px; border-radius: var(--r-sm); overflow: auto; max-height: 320px; white-space: pre-wrap; word-break: break-all; margin: 10px 0 0; }
+    pre { font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--text-3); background: var(--bg); border-left: 2px solid rgba(212,122,90,0.14); padding: 10px 12px; border-radius: var(--r-sm); overflow: auto; max-height: 320px; white-space: pre-wrap; word-break: break-all; margin: 10px 0 0; }
     .v-empty { font-family: var(--mono); font-size: 12px; color: var(--text-3); padding: 20px 0; text-align: center; }
 
-    .server-add { display: grid; grid-template-columns: 1fr 2fr 1fr 1fr auto; gap: 8px; margin-bottom: 12px; }
+    .server-add { display: grid; grid-template-columns: 1fr 2fr 1fr 1fr 1fr auto; gap: 8px; margin-bottom: 12px; }
     .server-list { display: grid; gap: 10px; }
     .server-card { border: 1px dashed var(--border); border-radius: var(--r-sm); background: rgba(0,0,0,0.16); padding: 10px; display: grid; gap: 8px; position: relative; }
     .server-card::before, .server-card::after {
@@ -466,17 +489,17 @@ async fn root() -> Html<&'static str> {
     .server-title { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; min-width: 0; }
     .server-name { color: var(--text); font-weight: 600; }
     .server-url { color: var(--text-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .server-controls { display: grid; grid-template-columns: 1fr 1fr auto auto auto; gap: 8px; align-items: center; }
+    .server-controls { display: grid; grid-template-columns: 1fr 1fr 1fr auto auto auto; gap: 8px; align-items: center; }
     .auth-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-family: var(--mono); font-size: 11px; color: var(--text-2); }
     .chip-auth { display: inline-flex; align-items: center; gap: 6px; }
 
     input, select, textarea { font-family: var(--mono); font-size: 12px; padding: 7px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); outline: none; }
-    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(212,148,58,0.15); }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(212,122,90,0.15); }
     input::placeholder, textarea::placeholder { color: var(--text-3); }
     select:disabled, input:disabled, textarea:disabled { opacity: 0.45; cursor: not-allowed; }
     textarea { min-height: 72px; resize: vertical; }
 
-    button { font-family: var(--sans); font-size: 12px; font-weight: 600; padding: 7px 12px; border: none; border-radius: var(--r-sm); cursor: pointer; background: var(--accent); color: #101113; }
+    button { font-family: var(--sans); font-size: 12px; font-weight: 600; padding: 7px 12px; border: none; border-radius: var(--r-sm); cursor: pointer; background: var(--accent); color: #0e0b10; }
     button:hover { opacity: 0.9; }
     button:disabled { opacity: 0.45; cursor: wait; }
     .btn-quiet { background: transparent; color: var(--text-2); border: 1px dashed var(--border); }
@@ -486,6 +509,7 @@ async fn root() -> Html<&'static str> {
     .tool-toolbar { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 8px; margin-bottom: 12px; }
     .tool-list { display: grid; gap: 8px; }
     .tool-row { border: 1px dashed var(--border); border-radius: var(--r-sm); background: rgba(0,0,0,0.16); padding: 10px; display: grid; gap: 8px; position: relative; }
+    .tool-row.tool-row-disabled { opacity: 0.6; }
     .tool-row::before, .tool-row::after {
       content: '+';
       position: absolute;
@@ -513,7 +537,7 @@ async fn root() -> Html<&'static str> {
     .pill-safe { border-color: rgba(122,191,138,0.35); color: var(--green); background: rgba(122,191,138,0.08); }
     .pill-esc { border-color: rgba(212,106,106,0.35); color: var(--red); background: rgba(212,106,106,0.09); }
     .pill-src { color: var(--text-3); }
-    .pill-override { border-color: rgba(212,148,58,0.5); color: var(--accent); background: var(--accent-bg); }
+    .pill-override { border-color: rgba(212,122,90,0.5); color: var(--accent); background: var(--accent-bg); }
     .fail { padding: 6px 8px; background: var(--red-bg); border-left: 2px solid var(--red); border-radius: 0 var(--r-sm) var(--r-sm) 0; font-family: var(--mono); font-size: 11px; color: var(--red); margin-bottom: 8px; }
 
     .logs-pre { max-height: 72vh; min-height: 260px; margin: 0; }
@@ -562,6 +586,10 @@ async fn root() -> Html<&'static str> {
             <option value="all-safe">all-safe</option>
             <option value="all-escalated">all-escalated</option>
             <option value="custom">custom</option>
+          </select>
+          <select id="server-tool-default-add">
+            <option value="all">all tools active</option>
+            <option value="none">no tools active</option>
           </select>
           <button type="submit">Add Server</button>
         </form>
@@ -614,6 +642,8 @@ async fn root() -> Html<&'static str> {
 
     const state = {
       currentServers: [],
+      serverActivationModes: {},
+      toolActivationOverrides: {},
       serverPolicyModes: {},
       descriptionOverrides: {},
       authStatuses: [],
@@ -794,6 +824,7 @@ async fn root() -> Html<&'static str> {
       let h = '';
       for (const s of servers) {
         const exposure = s.exposure_mode || 'passthrough';
+        const toolDefault = (state.serverActivationModes && state.serverActivationModes[s.name]) || 'all';
         const policy = (state.serverPolicyModes && state.serverPolicyModes[s.name]) || 'heuristic';
         const enabled = s.enabled !== false;
         const auth = authViewModelByServer(s.name);
@@ -805,6 +836,7 @@ async fn root() -> Html<&'static str> {
         h += '<div class="server-controls">';
         h += '<select class="server-exposure-select" data-server="' + escAttrHtml(s.name) + '">' + exposureOptions(exposure) + '</select>';
         h += '<select class="server-policy-select" data-server="' + escAttrHtml(s.name) + '">' + policyOptions(policy) + '</select>';
+        h += '<select class="server-tool-default-select" data-server="' + escAttrHtml(s.name) + '">' + toolDefaultOptions(toolDefault) + '</select>';
         if (authStatus.action === 'login') {
           h += '<button type="button" class="btn-quiet" data-action="server-login" data-server="' + escAttrHtml(s.name) + '">Login</button>';
         } else if (authStatus.action === 'refresh') {
@@ -815,7 +847,7 @@ async fn root() -> Html<&'static str> {
         h += '<button type="button" class="btn-quiet" data-action="toggle-server" data-server="' + escAttrHtml(s.name) + '" data-enabled="' + escAttrHtml(String(enabled)) + '">' + toggleLabel + '</button>';
         h += '<button type="button" class="btn-d" data-action="remove-server" data-server="' + escAttrHtml(s.name) + '">' + (wantsConfirm ? 'Confirm Remove' : 'Remove') + '</button>';
         h += '</div>';
-        h += '<div class="auth-line"><span class="chip-auth"><span class="dot ' + authStatus.dot + '"></span>' + esc(authStatus.text) + '</span><span class="pill pill-src">state=' + (enabled ? 'enabled' : 'disabled') + ' · exposure=' + esc(exposure) + ' · policy=' + esc(policy) + '</span></div>';
+        h += '<div class="auth-line"><span class="chip-auth"><span class="dot ' + authStatus.dot + '"></span>' + esc(authStatus.text) + '</span><span class="pill pill-src">state=' + (enabled ? 'enabled' : 'disabled') + ' · exposure=' + esc(exposure) + ' · tools=' + esc(toolDefault) + ' · policy=' + esc(policy) + '</span></div>';
         h += '</article>';
       }
       v.innerHTML = h;
@@ -831,6 +863,14 @@ async fn root() -> Html<&'static str> {
 
     function policyOptions(selected) {
       const options = ['heuristic', 'all-safe', 'all-escalated', 'custom'];
+      return options.map(function(value) {
+        const sel = value === selected ? ' selected' : '';
+        return '<option value="' + value + '"' + sel + '>' + value + '</option>';
+      }).join('');
+    }
+
+    function toolDefaultOptions(selected) {
+      const options = ['all', 'none'];
       return options.map(function(value) {
         const sel = value === selected ? ' selected' : '';
         return '<option value="' + value + '"' + sel + '>' + value + '</option>';
@@ -915,20 +955,24 @@ async fn root() -> Html<&'static str> {
         }
         const key = toolKey(t.server, t.upstream_name || toolName);
         const activeSafe = t.policy_level === 'safe';
+        const enabled = t.enabled !== false;
+        const activationSource = t.activation_source || 'catalog-all';
         const safeClass = activeSafe ? 'pill-btn pill-safe' : 'pill-btn';
         const escClass = !activeSafe ? 'pill-btn pill-esc' : 'pill-btn';
+        const enabledClass = enabled ? 'pill-btn pill-safe' : 'pill-btn pill-esc';
         const override = overrideText(t.server, t.upstream_name || toolName);
         const isEditing = state.editingToolKey === key;
         const original = typeof t.original_description === 'string' ? t.original_description : '';
         const source = t.policy_source || 'heuristic';
-        h += '<article class="tool-row">';
+        h += '<article class="tool-row' + (enabled ? '' : ' tool-row-disabled') + '">';
         h += '<div class="tool-top">';
         h += '<div class="tool-actions">';
+        h += '<button type="button" class="' + enabledClass + '" data-action="toggle-tool-enabled" data-server="' + escAttrHtml(t.server) + '" data-tool="' + escAttrHtml(t.upstream_name || toolName) + '" data-enabled="' + escAttrHtml(String(enabled)) + '">' + (enabled ? 'active' : 'inactive') + '</button>';
         h += '<button type="button" class="' + safeClass + '" data-action="set-policy" data-server="' + escAttrHtml(t.server) + '" data-tool="' + escAttrHtml(t.upstream_name || toolName) + '" data-level="safe">safe</button>';
         h += '<button type="button" class="' + escClass + '" data-action="set-policy" data-server="' + escAttrHtml(t.server) + '" data-tool="' + escAttrHtml(t.upstream_name || toolName) + '" data-level="escalated">escalated</button>';
         h += '</div>';
         h += '<div class="tool-name"><span class="tool-ns">' + esc(nsPrefix) + '</span>' + esc(toolName) + '</div>';
-        h += '<span class="pill pill-src">' + esc(source) + '</span>';
+        h += '<span class="pill pill-src">' + esc(activationSource) + ' · ' + esc(source) + '</span>';
         h += '</div>';
         h += '<div class="tool-desc">';
         if (isEditing) {
@@ -1002,6 +1046,8 @@ async fn root() -> Html<&'static str> {
           state.toolsRefreshAtMs = Date.now();
         }
         state.currentServers = serversPayload.servers || [];
+        state.serverActivationModes = serversPayload.server_tool_activation_modes || {};
+        state.toolActivationOverrides = serversPayload.tool_activation_overrides || {};
         state.serverPolicyModes = serversPayload.server_tool_policy_modes || {};
         state.descriptionOverrides = serversPayload.tool_description_overrides || {};
         state.authStatuses = authPayload.statuses || [];
@@ -1009,6 +1055,8 @@ async fn root() -> Html<&'static str> {
         document.getElementById('tools-raw').textContent = JSON.stringify(state.toolsPayload || {}, null, 2);
         document.getElementById('servers-raw').textContent = JSON.stringify({
           servers: state.currentServers,
+          server_tool_activation_modes: state.serverActivationModes,
+          tool_activation_overrides: state.toolActivationOverrides,
           server_tool_policy_modes: serversPayload.server_tool_policy_modes || {},
           tool_description_overrides: state.descriptionOverrides,
           tool_policy_overrides: serversPayload.tool_policy_overrides || {}
@@ -1128,6 +1176,14 @@ async fn root() -> Html<&'static str> {
         });
         return;
       }
+      if (action === 'toggle-tool-enabled') {
+        const enabled = target.getAttribute('data-enabled') === 'true';
+        await runAction('set tool activation', async function() {
+          await postJson('/tool-activation', { server: server, tool: tool, enabled: !enabled });
+          await refresh({ forceTools: true });
+        });
+        return;
+      }
       if (action === 'edit-desc') {
         const key = target.getAttribute('data-key') || '';
         state.editingToolKey = key;
@@ -1194,6 +1250,14 @@ async fn root() -> Html<&'static str> {
           await refresh({ forceTools: true });
         });
       }
+      if (target.classList.contains('server-tool-default-select')) {
+        const server = target.getAttribute('data-server') || '';
+        const value = target.value;
+        await runAction('set tool default mode', async function() {
+          await postJson('/servers/' + encodeURIComponent(server) + '/tool-default', { tool_activation_mode: value });
+          await refresh({ forceTools: true });
+        });
+      }
     });
 
     document.getElementById('server-add-form').addEventListener('submit', async function(event) {
@@ -1203,7 +1267,8 @@ async fn root() -> Html<&'static str> {
           name: document.getElementById('server-name').value,
           url: document.getElementById('server-url').value,
           exposure_mode: document.getElementById('server-exposure-add').value,
-          policy_mode: document.getElementById('server-policy-add').value
+          policy_mode: document.getElementById('server-policy-add').value,
+          tool_activation_mode: document.getElementById('server-tool-default-add').value
         });
         event.target.reset();
         await refresh({ forceTools: true });
@@ -1284,6 +1349,8 @@ async fn servers(State(state): State<AppState>) -> Result<Json<ServersResponse>,
     let cfg = load_config(&state).await?;
     Ok(Json(ServersResponse {
         servers: cfg.servers,
+        server_tool_activation_modes: cfg.server_tool_activation_modes,
+        tool_activation_overrides: cfg.tool_activation_overrides,
         server_tool_policy_modes: cfg.server_tool_policy_modes,
         tool_description_overrides: cfg.tool_description_overrides,
         tool_policy_overrides: cfg.tool_policy_overrides,
@@ -1297,6 +1364,7 @@ async fn add_server(
     let server_name = request.name.clone();
     let server_name_for_update = server_name.clone();
     let policy_mode = request.policy_mode;
+    let tool_activation_mode = request.tool_activation_mode;
     let server = ServerConfig {
         name: request.name,
         url: request.url,
@@ -1309,7 +1377,8 @@ async fn add_server(
         .store
         .update_async(move |cfg| {
             cfg.add_server(server)?;
-            cfg.set_server_tool_policy_mode(&server_name_for_update, policy_mode)
+            cfg.set_server_tool_policy_mode(&server_name_for_update, policy_mode)?;
+            cfg.set_server_tool_activation_mode(&server_name_for_update, tool_activation_mode)
         })
         .await
         .map_err(|err| {
@@ -1397,6 +1466,30 @@ async fn update_server_tool_policy(
     Ok(Json(MutationResponse { status: "ok" }))
 }
 
+async fn update_server_tool_activation(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(request): Json<UpdateServerToolActivationRequest>,
+) -> Result<Json<MutationResponse>, ApiError> {
+    let target_name = name.clone();
+    state
+        .store
+        .update_async(move |cfg| {
+            cfg.set_server_tool_activation_mode(&target_name, request.tool_activation_mode)
+        })
+        .await
+        .map_err(|err| {
+            error!(
+                error = %err,
+                server = %name,
+                "failed to update server tool activation mode"
+            );
+            ApiError::bad_request(format!("failed to update tool default: {err}"))
+        })?;
+    state.upstream.invalidate_discovery_cache().await;
+    Ok(Json(MutationResponse { status: "ok" }))
+}
+
 async fn update_server_enabled(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -1421,6 +1514,34 @@ async fn update_server_enabled(
         state.upstream.evict_server(&name).await;
     }
     state.upstream.invalidate_discovery_cache().await;
+    Ok(Json(MutationResponse { status: "ok" }))
+}
+
+async fn set_tool_activation_override(
+    State(state): State<AppState>,
+    Json(request): Json<ToolActivationOverrideRequest>,
+) -> Result<Json<MutationResponse>, ApiError> {
+    let req_server = request.server.clone();
+    let req_tool = request.tool.clone();
+    let req_enabled = request.enabled;
+    state
+        .store
+        .update_async(move |cfg| {
+            cfg.set_tool_activation_override(&req_server, &req_tool, req_enabled)
+        })
+        .await
+        .map_err(|err| {
+            error!(
+                error = %err,
+                server = %request.server,
+                tool = %request.tool,
+                enabled = request.enabled,
+                "failed to set tool activation override"
+            );
+            ApiError::bad_request(format!("failed to set tool activation override: {err}"))
+        })?;
+    state.upstream.invalidate_discovery_cache().await;
+
     Ok(Json(MutationResponse { status: "ok" }))
 }
 
@@ -1644,6 +1765,7 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
         let description = override_description
             .clone()
             .unwrap_or_else(|| upstream_description.clone());
+        let activation = cfg.evaluate_tool_activation(&tool.server_name, &tool.upstream_name);
         let policy = cfg.evaluate_tool_policy(
             &tool.server_name,
             &tool.upstream_name,
@@ -1659,6 +1781,8 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
                     .map(|_| upstream_description.clone()),
                 server: Some(tool.server_name.clone()),
                 upstream_name: Some(tool.upstream_name.clone()),
+                enabled: activation.enabled,
+                activation_source: activation.source.as_str().to_string(),
                 policy_level: policy.level.as_str().to_string(),
                 policy_source: policy.source.as_str().to_string(),
             },
@@ -1673,6 +1797,8 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
             original_description: None,
             server: None,
             upstream_name: None,
+            enabled: true,
+            activation_source: "system".to_string(),
             policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
             policy_source: ToolPolicySource::System.as_str().to_string(),
         },
@@ -1686,6 +1812,8 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
             original_description: None,
             server: None,
             upstream_name: None,
+            enabled: true,
+            activation_source: "system".to_string(),
             policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
             policy_source: ToolPolicySource::System.as_str().to_string(),
         },
@@ -1700,6 +1828,8 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
             original_description: None,
             server: None,
             upstream_name: None,
+            enabled: true,
+            activation_source: "system".to_string(),
             policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
             policy_source: ToolPolicySource::System.as_str().to_string(),
         },
@@ -1715,6 +1845,8 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
                 original_description: None,
                 server: None,
                 upstream_name: None,
+                enabled: true,
+                activation_source: "system".to_string(),
                 policy_level: ToolPolicyLevel::Safe.as_str().to_string(),
                 policy_source: ToolPolicySource::System.as_str().to_string(),
             },
@@ -1729,6 +1861,8 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
                 original_description: None,
                 server: None,
                 upstream_name: None,
+                enabled: true,
+                activation_source: "system".to_string(),
                 policy_level: ToolPolicyLevel::Escalated.as_str().to_string(),
                 policy_source: ToolPolicySource::System.as_str().to_string(),
             },

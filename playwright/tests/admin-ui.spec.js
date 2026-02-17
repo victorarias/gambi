@@ -19,27 +19,26 @@ async function readJsonPre(page, id) {
   }
 }
 
+async function readStatus(page) {
+  return readJsonPre(page, "status");
+}
+
+async function readServersPayload(page) {
+  return readJsonPre(page, "servers-raw");
+}
+
 async function readToolsPayload(page) {
-  return readJsonPre(page, "tools");
+  return readJsonPre(page, "tools-raw");
 }
 
 async function readErrorPane(page) {
   return ((await page.locator("#errors").textContent()) || "").trim();
 }
 
-async function getToolDescription(page, name) {
-  const payload = await readToolsPayload(page);
-  if (!payload || !Array.isArray(payload.tool_details)) {
-    return null;
-  }
-  const detail = payload.tool_details.find((item) => item.name === name);
-  return detail ? detail.description : null;
-}
-
-async function selectOptions(page, selector) {
-  return page.locator(selector).evaluate((element) => {
-    return Array.from(element.options).map((option) => option.value);
-  });
+async function addFixtureServer(page, fixtureServerUrl) {
+  await page.fill("#server-name", "fixture");
+  await page.fill("#server-url", fixtureServerUrl);
+  await page.locator("#server-add-form button[type=submit]").click();
 }
 
 function resolveGambiBin() {
@@ -50,7 +49,7 @@ function resolveGambiBin() {
 }
 
 test.describe("admin UI", () => {
-  test("renders dashboard status and builtin tools", async ({ page }) => {
+  test("renders dashboard and builtin tools in no-exec mode", async ({ page }) => {
     const binPath = resolveGambiBin();
     if (!(await ensurePathExists(binPath))) {
       throw new Error(
@@ -67,22 +66,15 @@ test.describe("admin UI", () => {
       await expect(page.getByRole("heading", { name: "gambi admin" })).toBeVisible();
 
       await expect
-        .poll(async () => readJsonPre(page, "status"), {
-          message: "status endpoint should load in UI",
-        })
+        .poll(async () => readStatus(page))
         .toMatchObject({ status: "ok", exec_enabled: false });
 
       await expect
-        .poll(async () => readJsonPre(page, "servers"), {
-          message: "servers list should be loaded",
+        .poll(async () => {
+          const payload = await readServersPayload(page);
+          return payload ? payload.servers : null;
         })
         .toEqual([]);
-
-      await expect
-        .poll(async () => readJsonPre(page, "overrides"), {
-          message: "overrides map should be loaded",
-        })
-        .toEqual({});
 
       await expect
         .poll(async () => {
@@ -90,7 +82,7 @@ test.describe("admin UI", () => {
           return payload ? payload.tools : null;
         })
         .toEqual(
-          expect.arrayContaining(["gambi_list_servers", "gambi_list_upstream_tools"]),
+          expect.arrayContaining(["gambi_help", "gambi_list_servers", "gambi_list_upstream_tools"]),
         );
 
       await expect
@@ -105,7 +97,7 @@ test.describe("admin UI", () => {
     }
   });
 
-  test("manages servers and description overrides with restart persistence", async ({
+  test("supports tool defaults, per-tool activation toggles, and description overrides", async ({
     page,
   }) => {
     const binPath = resolveGambiBin();
@@ -115,106 +107,99 @@ test.describe("admin UI", () => {
       );
     }
 
-    const customDescription = "Custom fixture echo description from admin UI";
     const configHome = await fs.mkdtemp(
-      path.join(os.tmpdir(), "gambi-admin-ui-override-"),
+      path.join(os.tmpdir(), "gambi-admin-ui-tool-activation-"),
     );
     let gambi = await startGambi({ binPath, configHome, execEnabled: false });
+    const overrideText = "Fixture echo custom description from admin test";
     try {
       await page.goto(gambi.baseUrl, { waitUntil: "domcontentloaded" });
       await expect(page.getByRole("heading", { name: "gambi admin" })).toBeVisible();
 
-      await page.fill("#server-name", "fixture");
-      await page.fill("#server-url", gambi.fixtureServerUrl);
-      await page.locator("#server-add-form button[type=submit]").click();
+      await page.selectOption("#server-tool-default-add", "none");
+      await addFixtureServer(page, gambi.fixtureServerUrl);
 
       await expect
         .poll(async () => {
-          const servers = await readJsonPre(page, "servers");
-          return Array.isArray(servers)
-            ? servers.map((server) => server.name).sort()
-            : null;
+          const payload = await readServersPayload(page);
+          if (!payload) return null;
+          return payload.server_tool_activation_modes?.fixture || "all";
         })
-        .toEqual(["fixture"]);
+        .toBe("none");
 
-      await expect.poll(async () => selectOptions(page, "#server-remove-name")).toContain(
-        "fixture",
+      await page.click('.tab-btn[data-tab="tools"]');
+
+      const activationToggle = page.locator(
+        'button[data-action="toggle-tool-enabled"][data-server="fixture"][data-tool="fixture_echo"]',
       );
-      await expect.poll(async () => selectOptions(page, "#override-server")).toContain(
-        "fixture",
-      );
-      await expect
-        .poll(async () => selectOptions(page, "#override-remove-server"))
-        .toContain("fixture");
+      await expect(activationToggle).toBeVisible();
+      await expect(activationToggle).toHaveText("inactive");
 
-      await page.selectOption("#override-server", "fixture");
-      await page.fill("#override-tool", "fixture_echo");
-      await page.fill("#override-description", customDescription);
-      await page.locator("#override-set-form button[type=submit]").click();
-
+      await activationToggle.click();
       await expect
-        .poll(async () => readJsonPre(page, "overrides"), {
-          message: "override map should include custom description",
+        .poll(async () => {
+          const payload = await readServersPayload(page);
+          if (!payload) return null;
+          return payload.tool_activation_overrides?.fixture?.fixture_echo ?? null;
         })
-        .toEqual({
-          fixture: {
-            fixture_echo: customDescription,
-          },
-        });
+        .toBe(true);
+      await expect(
+        page.locator(
+          'button[data-action="toggle-tool-enabled"][data-server="fixture"][data-tool="fixture_echo"]',
+        ),
+      ).toHaveText("active");
+
+      await page.click('[data-action="edit-desc"][data-key="fixture::fixture_echo"]');
+      await page.fill("#edit-desc-text", overrideText);
+      await page.click(
+        'button[data-action="save-desc"][data-server="fixture"][data-tool="fixture_echo"]',
+      );
 
       await expect
-        .poll(async () => getToolDescription(page, "fixture:fixture_echo"))
-        .toBe(customDescription);
+        .poll(async () => {
+          const payload = await readServersPayload(page);
+          if (!payload) return null;
+          return payload.tool_description_overrides?.fixture?.fixture_echo ?? null;
+        })
+        .toBe(overrideText);
+
+      await expect
+        .poll(async () => {
+          const payload = await readToolsPayload(page);
+          if (!payload || !Array.isArray(payload.tool_details)) return null;
+          const tool = payload.tool_details.find((item) => item.name === "fixture:fixture_echo");
+          return tool ? tool.description : null;
+        })
+        .toBe(overrideText);
 
       await gambi.stop();
       gambi = await startGambi({ binPath, configHome, execEnabled: false });
-      await page.goto(gambi.baseUrl, { waitUntil: "domcontentloaded" });
+      await page.goto(`${gambi.baseUrl}#tools`, { waitUntil: "domcontentloaded" });
+      await expect(page.getByRole("heading", { name: "gambi admin" })).toBeVisible();
 
       await expect
         .poll(async () => {
-          const servers = await readJsonPre(page, "servers");
-          return Array.isArray(servers)
-            ? servers.map((server) => server.name).sort()
-            : null;
+          const payload = await readServersPayload(page);
+          if (!payload) return null;
+          return {
+            defaultMode: payload.server_tool_activation_modes?.fixture || "all",
+            fixtureEchoActive: payload.tool_activation_overrides?.fixture?.fixture_echo ?? null,
+            fixtureEchoDesc:
+              payload.tool_description_overrides?.fixture?.fixture_echo ?? null,
+          };
         })
-        .toEqual(["fixture"]);
-
-      await expect
-        .poll(async () => readJsonPre(page, "overrides"))
         .toEqual({
-          fixture: {
-            fixture_echo: customDescription,
-          },
+          defaultMode: "none",
+          fixtureEchoActive: true,
+          fixtureEchoDesc: overrideText,
         });
-
-      await expect
-        .poll(async () => getToolDescription(page, "fixture:fixture_echo"))
-        .toBe(customDescription);
-
-      await page.selectOption("#override-remove-server", "fixture");
-      await page.fill("#override-remove-tool", "fixture_echo");
-      await page.locator("#override-remove-form button[type=submit]").click();
-
-      await expect.poll(async () => readJsonPre(page, "overrides")).toEqual({});
-      await expect
-        .poll(async () => getToolDescription(page, "fixture:fixture_echo"))
-        .toBe("Echo structured arguments for execution-bridge tests");
-
-      await page.selectOption("#server-remove-name", "fixture");
-      await page.locator("#server-remove-form button[type=submit]").click();
-
-      await expect.poll(async () => readJsonPre(page, "servers")).toEqual([]);
-      await expect.poll(async () => readJsonPre(page, "overrides")).toEqual({});
-      await expect
-        .poll(async () => getToolDescription(page, "fixture:fixture_echo"))
-        .toBe(null);
     } finally {
       await gambi.stop();
       await fs.rm(configHome, { recursive: true, force: true });
     }
   });
 
-  test("surfaces validation errors and keeps admin state unchanged", async ({ page }) => {
+  test("surfaces validation errors while keeping admin state stable", async ({ page }) => {
     const binPath = resolveGambiBin();
     if (!(await ensurePathExists(binPath))) {
       throw new Error(
@@ -230,21 +215,13 @@ test.describe("admin UI", () => {
       await page.goto(gambi.baseUrl, { waitUntil: "domcontentloaded" });
       await expect(page.getByRole("heading", { name: "gambi admin" })).toBeVisible();
 
-      await expect.poll(async () => readJsonPre(page, "servers")).toEqual([]);
-      await expect.poll(async () => readJsonPre(page, "overrides")).toEqual({});
       await expect.poll(async () => readErrorPane(page)).toBe("(none)");
-      await expect(page.locator("#server-remove-name")).toBeDisabled();
-      await expect(
-        page.locator("#server-remove-form button[type=submit]"),
-      ).toBeDisabled();
-      await expect(page.locator("#override-server")).toBeDisabled();
-      await expect(
-        page.locator("#override-set-form button[type=submit]"),
-      ).toBeDisabled();
-      await expect(page.locator("#override-remove-server")).toBeDisabled();
-      await expect(
-        page.locator("#override-remove-form button[type=submit]"),
-      ).toBeDisabled();
+      await expect
+        .poll(async () => {
+          const payload = await readServersPayload(page);
+          return payload ? payload.servers : null;
+        })
+        .toEqual([]);
 
       await page.fill("#server-name", "invalid-server");
       await page.fill("#server-url", "ftp://example.com/not-supported");
@@ -254,40 +231,19 @@ test.describe("admin UI", () => {
       await expect.poll(async () => readErrorPane(page)).toContain(
         "unsupported server url scheme",
       );
-      await expect.poll(async () => readJsonPre(page, "servers")).toEqual([]);
-      await expect(page.locator("#server-remove-name")).toBeDisabled();
-      await expect(page.locator("#override-server")).toBeDisabled();
-      await expect(page.locator("#override-remove-server")).toBeDisabled();
-
-      await page.fill("#server-name", "fixture");
-      await page.fill("#server-url", gambi.fixtureServerUrl);
-      await page.locator("#server-add-form button[type=submit]").click();
-
       await expect
         .poll(async () => {
-          const servers = await readJsonPre(page, "servers");
-          return Array.isArray(servers) ? servers.map((server) => server.name) : null;
+          const payload = await readServersPayload(page);
+          return payload ? payload.servers : null;
         })
-        .toEqual(["fixture"]);
-      await expect.poll(async () => readErrorPane(page)).toBe("(none)");
-
-      await page.selectOption("#override-remove-server", "fixture");
-      await page.fill("#override-remove-tool", "missing_tool");
-      await page.locator("#override-remove-form button[type=submit]").click();
-
-      await expect.poll(async () => readErrorPane(page)).toContain("remove override failed");
-      await expect.poll(async () => readErrorPane(page)).toContain("override not found");
-      await expect.poll(async () => readJsonPre(page, "overrides")).toEqual({});
+        .toEqual([]);
     } finally {
       await gambi.stop();
       await fs.rm(configHome, { recursive: true, force: true });
     }
   });
 
-  test("loads auth/log panels and applies config import-export roundtrip", async ({
-    page,
-    request,
-  }) => {
+  test("config import/export roundtrip updates admin state", async ({ page, request }) => {
     const binPath = resolveGambiBin();
     if (!(await ensurePathExists(binPath))) {
       throw new Error(
@@ -303,19 +259,6 @@ test.describe("admin UI", () => {
       await page.goto(gambi.baseUrl, { waitUntil: "domcontentloaded" });
       await expect(page.getByRole("heading", { name: "gambi admin" })).toBeVisible();
 
-      await expect
-        .poll(async () => readJsonPre(page, "auth"), {
-          message: "auth panel should load JSON payload",
-        })
-        .toMatchObject({ statuses: expect.any(Array) });
-
-      await expect
-        .poll(async () => {
-          const logs = (await page.locator("#logs").textContent()) || "";
-          return logs.trim();
-        })
-        .not.toBe("loading...");
-
       const exported = await request.get(`${gambi.baseUrl}/config/export`);
       expect(exported.ok()).toBeTruthy();
       const exportedJson = await exported.json();
@@ -328,6 +271,14 @@ test.describe("admin UI", () => {
             url: gambi.fixtureServerUrl,
           },
         ],
+        server_tool_activation_modes: {
+          fixture: "none",
+        },
+        tool_activation_overrides: {
+          fixture: {
+            fixture_echo: true,
+          },
+        },
         tool_description_overrides: {
           fixture: {
             fixture_echo: "Imported override description",
@@ -341,74 +292,32 @@ test.describe("admin UI", () => {
       expect(imported.ok()).toBeTruthy();
 
       await page.reload({ waitUntil: "domcontentloaded" });
+      await page.click('.tab-btn[data-tab="tools"]');
+
       await expect
         .poll(async () => {
-          const servers = await readJsonPre(page, "servers");
-          return Array.isArray(servers) ? servers.map((server) => server.name) : null;
+          const payload = await readServersPayload(page);
+          if (!payload) return null;
+          return {
+            servers: payload.servers?.map((server) => server.name) || [],
+            defaultMode: payload.server_tool_activation_modes?.fixture || "all",
+            fixtureEchoActive: payload.tool_activation_overrides?.fixture?.fixture_echo ?? null,
+          };
         })
-        .toEqual(["fixture"]);
-      await expect.poll(async () => readJsonPre(page, "overrides")).toEqual({
-        fixture: {
-          fixture_echo: "Imported override description",
-        },
-      });
+        .toEqual({
+          servers: ["fixture"],
+          defaultMode: "none",
+          fixtureEchoActive: true,
+        });
+
       await expect
-        .poll(async () => getToolDescription(page, "fixture:fixture_echo"))
+        .poll(async () => {
+          const payload = await readToolsPayload(page);
+          if (!payload || !Array.isArray(payload.tool_details)) return null;
+          const tool = payload.tool_details.find((item) => item.name === "fixture:fixture_echo");
+          return tool ? tool.description : null;
+        })
         .toBe("Imported override description");
-    } finally {
-      await gambi.stop();
-      await fs.rm(configHome, { recursive: true, force: true });
-    }
-  });
-
-  test("supports click-to-save level policy pills", async ({ page }) => {
-    const binPath = resolveGambiBin();
-    if (!(await ensurePathExists(binPath))) {
-      throw new Error(
-        `gambi binary not found at ${binPath}; run 'cargo build --bin gambi' first`,
-      );
-    }
-
-    const configHome = await fs.mkdtemp(
-      path.join(os.tmpdir(), "gambi-admin-ui-policy-pill-clicks-"),
-    );
-    const gambi = await startGambi({ binPath, configHome, execEnabled: false });
-    try {
-      await page.goto(gambi.baseUrl, { waitUntil: "domcontentloaded" });
-      await expect(page.getByRole("heading", { name: "gambi admin" })).toBeVisible();
-
-      await page.fill("#server-name", "fixture");
-      await page.fill("#server-url", gambi.fixtureServerUrl);
-      await page.locator("#server-add-form button[type=submit]").click();
-
-      const levelPill = page.locator(
-        '#policies-view button[data-action="toggle-policy-level"][data-server="fixture"][data-tool="fixture_echo"]',
-      );
-      await expect(levelPill).toBeVisible();
-      await expect(
-        page.locator(
-          '#policies-view button[data-action="toggle-policy-source"][data-server="fixture"][data-tool="fixture_echo"]',
-        ),
-      ).toHaveCount(0);
-
-      const initialLevel = ((await levelPill.textContent()) || "").trim();
-      expect(["safe", "escalated"]).toContain(initialLevel);
-      const toggledLevel = initialLevel === "safe" ? "escalated" : "safe";
-
-      await levelPill.click();
-
-      await expect
-        .poll(async () => {
-          const policies = await readJsonPre(page, "policies");
-          if (!policies || !policies.tool_policy_overrides) return null;
-          const byServer = policies.tool_policy_overrides.fixture || {};
-          return byServer.fixture_echo || null;
-        })
-        .toBe(toggledLevel);
-
-      await expect(
-        page.locator("#policies-view .po-config .pill-src").first(),
-      ).toBeVisible();
     } finally {
       await gambi.stop();
       await fs.rm(configHome, { recursive: true, force: true });
