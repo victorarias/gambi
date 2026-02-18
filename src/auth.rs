@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -9,8 +10,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::config::{ConfigStore, OAuthConfig};
@@ -20,6 +22,7 @@ const AUTO_REFRESH_LOOP_INTERVAL: Duration = Duration::from_secs(15);
 const AUTO_REFRESH_LEAD_SECONDS: u64 = 120;
 const REFRESH_BACKOFF_BASE_SECONDS: u64 = 5;
 const REFRESH_BACKOFF_MAX_SECONDS: u64 = 300;
+const REFRESH_LOCK_WAIT_LOG_THRESHOLD_MS: u128 = 25;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenState {
@@ -170,6 +173,18 @@ pub struct AuthManager {
     retry_state: Arc<Mutex<HashMap<String, RefreshRetryState>>>,
     http: Client,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenRemovalDecision {
+    Removed,
+    NoToken,
+    RefreshTokenChanged {
+        current_refresh_token_fingerprint: Option<String>,
+    },
+}
+
+static REFRESH_LOCKS_BY_SERVER: OnceLock<Mutex<HashMap<String, Arc<TokioMutex<()>>>>> =
+    OnceLock::new();
 
 impl AuthManager {
     pub fn new(store: ConfigStore) -> Self {
@@ -388,21 +403,94 @@ impl AuthManager {
     }
 
     pub async fn refresh(&self, server_name: &str) -> Result<AuthRefreshResponse> {
-        match self.refresh_once(server_name).await {
+        let lock = refresh_lock_for_server(server_name);
+        let lock_wait_started = Instant::now();
+        let _lock_guard = lock.lock().await;
+        let lock_wait_ms = lock_wait_started.elapsed().as_millis();
+        if lock_wait_ms >= REFRESH_LOCK_WAIT_LOG_THRESHOLD_MS {
+            info!(
+                server = %server_name,
+                wait_ms = lock_wait_ms,
+                "oauth refresh waited for in-flight refresh lock"
+            );
+        }
+
+        let refresh_token = match self.load_server_refresh_token(server_name).await {
+            Ok(token) => token,
+            Err(err) => {
+                let _ = self
+                    .mark_server_degraded(server_name, err.to_string(), None)
+                    .await;
+                return Err(err);
+            }
+        };
+        let refresh_token_fingerprint = token_fingerprint(&refresh_token);
+        info!(
+            server = %server_name,
+            refresh_token_fingerprint = %refresh_token_fingerprint,
+            "starting oauth refresh attempt"
+        );
+
+        match self.refresh_once(server_name, &refresh_token).await {
             Ok(response) => {
                 self.clear_retry_state(server_name);
+                info!(
+                    server = %server_name,
+                    refresh_token_fingerprint = %refresh_token_fingerprint,
+                    refreshed = response.refreshed,
+                    expires_at_epoch_seconds = ?response.expires_at_epoch_seconds,
+                    "oauth refresh succeeded"
+                );
                 Ok(response)
             }
             Err(err) => {
                 if refresh_error_requires_relogin(&err.to_string()) {
-                    let server_name = server_name.to_string();
-                    let _ = self
+                    let server_name_for_update = server_name.to_string();
+                    let refresh_token_for_update = refresh_token.clone();
+                    match self
                         .store
                         .update_tokens_async::<TokenState, _, _>(move |tokens| {
-                            tokens.oauth_tokens.remove(&server_name);
-                            Ok(())
+                            Ok(remove_oauth_token_if_refresh_token_matches(
+                                tokens,
+                                &server_name_for_update,
+                                Some(refresh_token_for_update.as_str()),
+                            ))
                         })
-                        .await;
+                        .await
+                    {
+                        Ok(TokenRemovalDecision::Removed) => {
+                            info!(
+                                server = %server_name,
+                                refresh_token_fingerprint = %refresh_token_fingerprint,
+                                "oauth refresh failed with relogin-required error; removed matching stale token"
+                            );
+                        }
+                        Ok(TokenRemovalDecision::NoToken) => {
+                            info!(
+                                server = %server_name,
+                                refresh_token_fingerprint = %refresh_token_fingerprint,
+                                "oauth refresh failed with relogin-required error but token was already absent"
+                            );
+                        }
+                        Ok(TokenRemovalDecision::RefreshTokenChanged {
+                            current_refresh_token_fingerprint,
+                        }) => {
+                            warn!(
+                                server = %server_name,
+                                attempted_refresh_token_fingerprint = %refresh_token_fingerprint,
+                                current_refresh_token_fingerprint = ?current_refresh_token_fingerprint,
+                                "oauth refresh failed with relogin-required error, but current refresh token changed; preserving latest token"
+                            );
+                        }
+                        Err(update_err) => {
+                            warn!(
+                                server = %server_name,
+                                attempted_refresh_token_fingerprint = %refresh_token_fingerprint,
+                                error = %update_err,
+                                "oauth refresh failed with relogin-required error, and stale-token cleanup failed"
+                            );
+                        }
+                    }
                 }
                 let _ = self
                     .mark_server_degraded(server_name, err.to_string(), None)
@@ -473,6 +561,7 @@ impl AuthManager {
         if let Ok(mut retry_state) = self.retry_state.lock() {
             retry_state.retain(|server, _| server_names.contains(server));
         }
+        prune_refresh_lock_registry(&server_names);
 
         Ok(removed)
     }
@@ -507,7 +596,7 @@ impl AuthManager {
                 continue;
             }
 
-            match self.refresh_once(&server.name).await {
+            match self.refresh(&server.name).await {
                 Ok(_) => self.clear_retry_state(&server.name),
                 Err(err) => {
                     let (attempt, next_retry_epoch) = self.record_retry_failure(&server.name);
@@ -532,27 +621,31 @@ impl AuthManager {
         Ok(())
     }
 
-    async fn refresh_once(&self, server_name: &str) -> Result<AuthRefreshResponse> {
+    async fn refresh_once(
+        &self,
+        server_name: &str,
+        refresh_token: &str,
+    ) -> Result<AuthRefreshResponse> {
         let cfg = self.store.load_async().await?;
         let server = server_for_name(&cfg, server_name)?;
         let resolved = self
             .resolve_oauth_config(server_name, &server.url, server.oauth.as_ref(), None)
             .await?;
-        let current: TokenState = self.store.load_tokens_async().await?;
-
-        let Some(existing) = current.oauth_tokens.get(server_name) else {
-            bail!("no oauth token found for server '{server_name}'");
-        };
-        let Some(refresh_token) = existing.refresh_token.clone() else {
-            bail!("server '{server_name}' token does not include refresh_token");
-        };
+        let refresh_started = Instant::now();
+        let refresh_token_fingerprint = token_fingerprint(refresh_token);
+        info!(
+            server = %server_name,
+            token_url = %resolved.token_url,
+            refresh_token_fingerprint = %refresh_token_fingerprint,
+            "sending oauth refresh request"
+        );
 
         let response = self
             .http
             .post(&resolved.token_url)
             .form(&[
                 ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token.as_str()),
+                ("refresh_token", refresh_token),
                 ("client_id", resolved.client_id.as_str()),
             ])
             .send()
@@ -561,12 +654,33 @@ impl AuthManager {
         let status = response.status();
         let status_code = status.as_u16();
         let body = response.text().await.unwrap_or_default();
+        info!(
+            server = %server_name,
+            refresh_token_fingerprint = %refresh_token_fingerprint,
+            status = status_code,
+            elapsed_ms = refresh_started.elapsed().as_millis(),
+            "oauth refresh response received"
+        );
         if !status.is_success() {
             if refresh_error_requires_relogin(&body) {
+                warn!(
+                    server = %server_name,
+                    refresh_token_fingerprint = %refresh_token_fingerprint,
+                    status = status_code,
+                    body = %compact_log_body(&body),
+                    "oauth refresh failed and requires relogin"
+                );
                 bail!(
                     "oauth refresh returned error response ({status_code}): login required ({body})"
                 );
             }
+            warn!(
+                server = %server_name,
+                refresh_token_fingerprint = %refresh_token_fingerprint,
+                status = status_code,
+                body = %compact_log_body(&body),
+                "oauth refresh returned non-success status"
+            );
             bail!("oauth refresh returned error response ({status_code})");
         }
         let payload: Value =
@@ -582,10 +696,24 @@ impl AuthManager {
                 format!("{error_code}: {error_description}")
             };
             if refresh_error_requires_relogin(&details) {
+                warn!(
+                    server = %server_name,
+                    refresh_token_fingerprint = %refresh_token_fingerprint,
+                    status = status_code,
+                    oauth_error = %details,
+                    "oauth refresh payload indicates relogin required"
+                );
                 bail!(
                     "oauth refresh returned error response ({status_code}): login required ({details})"
                 );
             }
+            warn!(
+                server = %server_name,
+                refresh_token_fingerprint = %refresh_token_fingerprint,
+                status = status_code,
+                oauth_error = %details,
+                "oauth refresh payload returned oauth error"
+            );
             bail!("oauth refresh returned error response ({status_code}): {details}");
         }
         let response: OAuthTokenExchangeResponse =
@@ -593,7 +721,7 @@ impl AuthManager {
 
         let mut updated = build_token(response, &resolved.scopes);
         if updated.refresh_token.is_none() {
-            updated.refresh_token = Some(refresh_token);
+            updated.refresh_token = Some(refresh_token.to_string());
         }
         let expires_at = updated.expires_at_epoch_seconds;
 
@@ -614,6 +742,17 @@ impl AuthManager {
             refreshed: true,
             expires_at_epoch_seconds: expires_at,
         })
+    }
+
+    async fn load_server_refresh_token(&self, server_name: &str) -> Result<String> {
+        let current: TokenState = self.store.load_tokens_async().await?;
+        let Some(existing) = current.oauth_tokens.get(server_name) else {
+            bail!("no oauth token found for server '{server_name}'");
+        };
+        let Some(refresh_token) = existing.refresh_token.clone() else {
+            bail!("server '{server_name}' token does not include refresh_token");
+        };
+        Ok(refresh_token)
     }
 
     async fn resolve_oauth_config(
@@ -1007,6 +1146,71 @@ fn refresh_error_requires_relogin(message: &str) -> bool {
         || lower.contains("login required")
 }
 
+fn token_fingerprint(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn compact_log_body(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.chars().count() <= 240 {
+        return trimmed.to_string();
+    }
+    let prefix = trimmed.chars().take(240).collect::<String>();
+    format!("{prefix}...")
+}
+
+fn remove_oauth_token_if_refresh_token_matches(
+    tokens: &mut TokenState,
+    server_name: &str,
+    expected_refresh_token: Option<&str>,
+) -> TokenRemovalDecision {
+    let Some(existing) = tokens.oauth_tokens.get(server_name) else {
+        return TokenRemovalDecision::NoToken;
+    };
+    let current_refresh_token = existing.refresh_token.as_deref();
+    if current_refresh_token != expected_refresh_token {
+        return TokenRemovalDecision::RefreshTokenChanged {
+            current_refresh_token_fingerprint: current_refresh_token.map(token_fingerprint),
+        };
+    }
+    tokens.oauth_tokens.remove(server_name);
+    TokenRemovalDecision::Removed
+}
+
+fn refresh_lock_for_server(server_name: &str) -> Arc<TokioMutex<()>> {
+    let locks = REFRESH_LOCKS_BY_SERVER.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match locks.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("refresh lock registry was poisoned; recovering state");
+            poisoned.into_inner()
+        }
+    };
+    guard
+        .entry(server_name.to_string())
+        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+        .clone()
+}
+
+fn prune_refresh_lock_registry(server_names: &HashSet<String>) {
+    let Some(locks) = REFRESH_LOCKS_BY_SERVER.get() else {
+        return;
+    };
+    let mut guard = match locks.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("refresh lock registry was poisoned during prune; recovering state");
+            poisoned.into_inner()
+        }
+    };
+    guard.retain(|server, _| server_names.contains(server));
+}
+
 pub fn prune_token_state_for_server_names(
     tokens: &mut TokenState,
     server_names: &HashSet<String>,
@@ -1064,7 +1268,8 @@ mod tests {
     };
 
     use super::{
-        AuthManager, OAuthServerHealth, OAuthToken, TokenState, prune_token_state_for_server_names,
+        AuthManager, OAuthServerHealth, OAuthToken, TokenRemovalDecision, TokenState,
+        prune_token_state_for_server_names, remove_oauth_token_if_refresh_token_matches,
     };
     use crate::config::{AppConfig, ConfigStore, OAuthConfig, ServerConfig};
 
@@ -1277,6 +1482,55 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         assert!(!statuses[0].degraded);
         assert!(statuses[0].last_error.is_none());
+    }
+
+    #[test]
+    fn remove_token_if_refresh_token_matches_removes_token() {
+        let mut tokens = TokenState::default();
+        tokens.oauth_tokens.insert(
+            "port".to_string(),
+            OAuthToken {
+                access_token: "a".to_string(),
+                refresh_token: Some("r1".to_string()),
+                token_type: Some("Bearer".to_string()),
+                expires_at_epoch_seconds: Some(1),
+                scopes: vec![],
+            },
+        );
+
+        let decision = remove_oauth_token_if_refresh_token_matches(&mut tokens, "port", Some("r1"));
+        assert_eq!(decision, TokenRemovalDecision::Removed);
+        assert!(!tokens.oauth_tokens.contains_key("port"));
+    }
+
+    #[test]
+    fn remove_token_if_refresh_token_matches_preserves_newer_rotated_token() {
+        let mut tokens = TokenState::default();
+        tokens.oauth_tokens.insert(
+            "port".to_string(),
+            OAuthToken {
+                access_token: "a".to_string(),
+                refresh_token: Some("new-refresh".to_string()),
+                token_type: Some("Bearer".to_string()),
+                expires_at_epoch_seconds: Some(1),
+                scopes: vec![],
+            },
+        );
+
+        let decision =
+            remove_oauth_token_if_refresh_token_matches(&mut tokens, "port", Some("old-refresh"));
+        match decision {
+            TokenRemovalDecision::RefreshTokenChanged {
+                current_refresh_token_fingerprint,
+            } => {
+                assert!(
+                    current_refresh_token_fingerprint.is_some(),
+                    "expected fingerprint for mismatched current token"
+                );
+            }
+            other => panic!("expected RefreshTokenChanged decision, got {other:?}"),
+        }
+        assert!(tokens.oauth_tokens.contains_key("port"));
     }
 
     #[tokio::test]
