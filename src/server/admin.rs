@@ -528,11 +528,11 @@ async fn root() -> Html<&'static str> {
     .tool-desc { font-family: var(--mono); font-size: 11px; color: var(--text-2); display: grid; gap: 7px; }
     .desc-value { cursor: pointer; border: 1px solid transparent; border-radius: var(--r-sm); padding: 6px; margin: -6px; }
     .desc-value:hover { border-color: var(--border); background: rgba(255,255,255,0.01); }
-    .desc-edit-actions { display: inline-flex; gap: 6px; }
+    .desc-edit-actions { display: inline-flex; gap: 6px; align-items: center; }
     .desc-diff { border: 1px solid var(--border); border-radius: var(--r-sm); padding: 6px; background: rgba(0,0,0,0.2); display: grid; gap: 4px; font-size: 10px; }
     .diff-old { color: var(--text-3); }
     .diff-new { color: var(--accent); }
-    .pill { border: 1px solid var(--border); border-radius: 100px; padding: 1px 8px; font-size: 10px; color: var(--text-2); background: transparent; }
+    .pill { border: 1px solid var(--border); border-radius: 100px; padding: 1px 8px; font-size: 10px; color: var(--text-2); background: transparent; display: inline-flex; align-items: center; line-height: 1; }
     .pill-btn { font-family: var(--mono); cursor: pointer; border: 1px solid var(--border); border-radius: 100px; padding: 2px 8px; background: transparent; color: var(--text-2); }
     .pill-safe { border-color: rgba(122,191,138,0.35); color: var(--green); background: rgba(122,191,138,0.08); }
     .pill-esc { border-color: rgba(212,106,106,0.35); color: var(--red); background: rgba(212,106,106,0.09); }
