@@ -649,6 +649,8 @@ async fn root() -> Html<&'static str> {
       authStatuses: [],
       toolsPayload: null,
       toolsRefreshAtMs: 0,
+      latestLogsPayload: null,
+      logsDirty: false,
       activeTab: 'servers',
       rawVisible: { servers: false, tools: false, logs: false },
       filterText: '',
@@ -707,6 +709,28 @@ async fn root() -> Html<&'static str> {
       if (btn) {
         btn.textContent = state.rawVisible[kind] ? 'hide' : 'json';
       }
+    }
+
+    function selectionTouchesElement(element) {
+      if (!element) return false;
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return false;
+      const anchorNode = selection.anchorNode;
+      const focusNode = selection.focusNode;
+      return (anchorNode && element.contains(anchorNode)) || (focusNode && element.contains(focusNode));
+    }
+
+    function isSelectingLogsText() {
+      const logs = document.getElementById('logs');
+      const logsRaw = document.getElementById('logs-raw');
+      return selectionTouchesElement(logs) || selectionTouchesElement(logsRaw);
+    }
+
+    function renderLogsFromState() {
+      const payload = state.latestLogsPayload || {};
+      document.getElementById('logs-raw').textContent = JSON.stringify(payload, null, 2);
+      document.getElementById('logs').textContent = (payload.logs || []).join('\n');
+      state.logsDirty = false;
     }
 
     function setError(message) {
@@ -1061,8 +1085,12 @@ async fn root() -> Html<&'static str> {
           tool_description_overrides: state.descriptionOverrides,
           tool_policy_overrides: serversPayload.tool_policy_overrides || {}
         }, null, 2);
-        document.getElementById('logs-raw').textContent = JSON.stringify(logsPayload || {}, null, 2);
-        document.getElementById('logs').textContent = (logsPayload.logs || []).join('\n');
+        state.latestLogsPayload = logsPayload || {};
+        if (isSelectingLogsText()) {
+          state.logsDirty = true;
+        } else {
+          renderLogsFromState();
+        }
 
         renderStatusBar(statusPayload);
         renderStatusStrip();
@@ -1308,6 +1336,11 @@ async fn root() -> Html<&'static str> {
     setActiveTab(readHashTab());
     window.addEventListener('hashchange', function() {
       setActiveTab(readHashTab());
+    });
+    document.addEventListener('selectionchange', function() {
+      if (!state.logsDirty) return;
+      if (isSelectingLogsText()) return;
+      renderLogsFromState();
     });
 
     void refresh({ forceTools: true });
