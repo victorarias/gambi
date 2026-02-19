@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -33,6 +35,7 @@ use crate::upstream;
 
 const AGGREGATED_PAGE_SIZE: usize = 100;
 const COMPACT_DESCRIPTION_LIMIT: usize = 180;
+const INITIALIZE_INSTRUCTION_PREVIEW_LIMIT: usize = 600;
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct ListedServer {
@@ -42,6 +45,9 @@ struct ListedServer {
     tool_default: String,
     policy_mode: String,
     enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instruction: Option<String>,
+    instruction_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -95,15 +101,15 @@ struct HelpToolSummaryOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     policy_level: String,
-    policy_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct HelpServerOutput {
     name: String,
     url: String,
-    exposure_mode: String,
     tool_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instruction: Option<String>,
     tools: Vec<HelpToolSummaryOutput>,
 }
 
@@ -114,7 +120,6 @@ struct HelpToolDetailOutput {
     upstream_name: String,
     description: String,
     policy_level: String,
-    policy_source: String,
     input_schema: Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_schema: Option<Map<String, Value>>,
@@ -157,6 +162,71 @@ impl McpServer {
         }
         tools
     }
+
+    fn base_instructions(&self) -> &'static str {
+        if self.exec_enabled {
+            "gambi execute-only mode:\n\
+             1. Call gambi_help to inspect servers/tools and get full tool metadata.\n\
+             2. Check each server's instruction field for server-specific usage guidance.\n\
+             3. Call gambi_execute first (safe policy enforcement).\n\
+             4. If safe mode returns ESCALATION_REQUIRED, call gambi_execute_escalated.\n\
+             5. If discovery is sparse, call gambi_list_upstream_tools for diagnostics."
+        } else {
+            "gambi execute-only mode with execution disabled (--no-exec):\n\
+             Use gambi_help to inspect available upstream capabilities."
+        }
+    }
+
+    fn initialize_server_instruction_digest(&self) -> Option<String> {
+        let cfg = match self.store.load() {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                return Some(format!(
+                    "Configured servers (effective instruction preview):\n- unavailable: failed to load config ({err})"
+                ));
+            }
+        };
+        if cfg.servers.is_empty() {
+            return Some(
+                "Configured servers (effective instruction preview):\n- none configured"
+                    .to_string(),
+            );
+        }
+
+        let upstream_instructions = self.upstream.connected_server_instructions_snapshot();
+        let mut lines = Vec::with_capacity(cfg.servers.len());
+        for server in &cfg.servers {
+            let decision = cfg.resolve_server_instruction(&upstream_instructions, &server.name);
+            let enabled = if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let source = decision.source.as_str();
+            let instruction = decision
+                .instruction
+                .as_deref()
+                .map(summarize_instruction_for_initialize)
+                .unwrap_or_else(|| "none".to_string());
+            lines.push(format!(
+                "- {} ({enabled}, {source}): {instruction}",
+                server.name
+            ));
+        }
+        Some(format!(
+            "Configured servers (effective instruction preview):\n{}",
+            lines.join("\n")
+        ))
+    }
+
+    fn instructions_for_initialize(&self) -> String {
+        let mut instructions = self.base_instructions().to_string();
+        if let Some(digest) = self.initialize_server_instruction_digest() {
+            instructions.push_str("\n\n");
+            instructions.push_str(&digest);
+        }
+        instructions
+    }
 }
 
 #[tool_router(router = tool_router)]
@@ -166,7 +236,7 @@ impl McpServer {
         description = "List configured upstream servers"
     )]
     async fn gambi_list_servers(&self) -> Result<Json<ListServersOutput>, String> {
-        list_servers_output(&self.store).await
+        list_servers_output(&self.store, &self.upstream).await
     }
 
     #[tool(
@@ -190,7 +260,7 @@ impl McpServer {
 
     #[tool(
         name = "gambi_execute",
-        description = "Safe execution path: run Python workflow in gambi (Monty runtime) with policy-aware upstream tool-call bridge. Escalated tools are blocked with ESCALATION_REQUIRED."
+        description = "Safe execution path: run Python workflow in gambi (Monty runtime) with policy-aware upstream tool-call bridge. Use namespaced dot calls only, e.g. atlassian.searchJiraIssuesUsingJql(cloudId=\"...\", jql=\"...\"). Escalated tools are blocked with ESCALATION_REQUIRED."
     )]
     async fn gambi_execute(
         &self,
@@ -221,7 +291,7 @@ impl McpServer {
 
     #[tool(
         name = "gambi_execute_escalated",
-        description = "Escalated execution path: run Python workflow with full upstream tool access when safe mode returns ESCALATION_REQUIRED."
+        description = "Escalated execution path: run Python workflow with full upstream tool access when safe mode returns ESCALATION_REQUIRED. Use namespaced dot calls only, e.g. server.tool(keyword=\"value\")."
     )]
     async fn gambi_execute_escalated(
         &self,
@@ -253,22 +323,8 @@ impl McpServer {
 
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
-        let instructions = if self.exec_enabled {
-            "gambi execute-only mode:\n\
-             1. Call gambi_help to inspect servers/tools and get full tool metadata.\n\
-             2. Call gambi_execute first (safe policy enforcement).\n\
-             3. If safe mode returns ESCALATION_REQUIRED, call gambi_execute_escalated.\n\
-             4. Safe heuristic marks tools as safe when name starts with get/list/search/lookup/fetch, or description starts with get.\n\
-             5. Only tools marked active in gambi admin are available through help/execute.\n\
-             6. Direct namespaced upstream tool calls are disabled.\n\
-             7. If discovery is sparse, call gambi_list_upstream_tools for diagnostics."
-        } else {
-            "gambi execute-only mode with execution disabled (--no-exec):\n\
-             Use gambi_help to inspect available upstream capabilities. Direct namespaced tool calls are disabled."
-        };
-
         ServerInfo {
-            instructions: Some(instructions.into()),
+            instructions: Some(self.instructions_for_initialize()),
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
@@ -349,6 +405,22 @@ impl ServerHandler for McpServer {
         }
         self.tool_router.get(name).cloned()
     }
+}
+
+fn summarize_instruction_for_initialize(value: &str) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= INITIALIZE_INSTRUCTION_PREVIEW_LIMIT {
+        return collapsed;
+    }
+    let mut summary = String::with_capacity(INITIALIZE_INSTRUCTION_PREVIEW_LIMIT + 1);
+    for (index, ch) in collapsed.chars().enumerate() {
+        if index >= INITIALIZE_INSTRUCTION_PREVIEW_LIMIT {
+            break;
+        }
+        summary.push(ch);
+    }
+    summary.push('…');
+    summary
 }
 
 fn upstream_discovery_enabled_for_mcp_listing() -> bool {
@@ -952,6 +1024,60 @@ pub async fn run(
     wait_for_shutdown(service, shutdown).await
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct EffectiveMcpPreview {
+    pub initialize: Value,
+    pub tools_list: Value,
+    pub gambi_list_servers: Value,
+    pub gambi_list_upstream_tools: Value,
+    pub gambi_help: Value,
+}
+
+pub(crate) async fn effective_mcp_preview(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    exec_enabled: bool,
+) -> Result<EffectiveMcpPreview, String> {
+    let server = McpServer::new(store.clone(), upstream_manager.clone(), exec_enabled);
+    let initialize = serde_json::to_value(server.get_info())
+        .map_err(|err| format!("failed to serialize initialize preview: {err}"))?;
+    let tools_list_result = local_list_tools(server.local_tools(), None)
+        .await
+        .map_err(|err| format!("failed to build tools/list preview: {err}"))?;
+    let tools_list = serde_json::to_value(tools_list_result)
+        .map_err(|err| format!("failed to serialize tools/list preview: {err}"))?;
+
+    let gambi_list_servers =
+        serde_json::to_value(list_servers_output(store, upstream_manager).await?.0)
+            .map_err(|err| format!("failed to serialize gambi_list_servers preview: {err}"))?;
+    let gambi_list_upstream_tools =
+        serde_json::to_value(list_upstream_tools_output(store, upstream_manager).await?.0)
+            .map_err(|err| {
+                format!("failed to serialize gambi_list_upstream_tools preview: {err}")
+            })?;
+    let gambi_help = serde_json::to_value(
+        gambi_help_output(
+            store,
+            upstream_manager,
+            HelpRequest {
+                server: None,
+                tool: None,
+            },
+        )
+        .await?
+        .0,
+    )
+    .map_err(|err| format!("failed to serialize gambi_help preview: {err}"))?;
+
+    Ok(EffectiveMcpPreview {
+        initialize,
+        tools_list,
+        gambi_list_servers,
+        gambi_list_upstream_tools,
+        gambi_help,
+    })
+}
+
 async fn wait_for_shutdown<S>(
     service: rmcp::service::RunningService<rmcp::RoleServer, S>,
     shutdown: CancellationToken,
@@ -990,15 +1116,19 @@ fn handle_waiter_result(
     }
 }
 
-async fn list_servers_output(store: &ConfigStore) -> Result<Json<ListServersOutput>, String> {
+async fn list_servers_output(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+) -> Result<Json<ListServersOutput>, String> {
     let cfg = store.load_async().await.map_err(|err| err.to_string())?;
+    let upstream_instructions = upstream_manager.connected_server_instructions().await;
     let activation_modes = cfg.server_tool_activation_modes.clone();
     let policy_modes = cfg.server_tool_policy_modes.clone();
     let servers = cfg
         .servers
-        .into_iter()
+        .iter()
         .map(|server| {
-            let name = server.name;
+            let name = server.name.clone();
             let policy_mode = policy_modes
                 .get(&name)
                 .copied()
@@ -1011,13 +1141,16 @@ async fn list_servers_output(store: &ConfigStore) -> Result<Json<ListServersOutp
                 .unwrap_or_default()
                 .as_str()
                 .to_string();
+            let instruction = cfg.resolve_server_instruction(&upstream_instructions, &name);
             ListedServer {
                 name,
-                url: server.url,
+                url: server.url.clone(),
                 exposure_mode: server.exposure_mode.as_str().to_string(),
                 tool_default,
                 policy_mode,
                 enabled: server.enabled,
+                instruction: instruction.instruction,
+                instruction_source: instruction.source.as_str().to_string(),
             }
         })
         .collect();
@@ -1062,6 +1195,7 @@ async fn gambi_help_output(
     request: HelpRequest,
 ) -> Result<Json<HelpResponse>, String> {
     let cfg = store.load_async().await.map_err(|err| err.to_string())?;
+    let upstream_instructions = upstream_manager.connected_server_instructions().await;
 
     let selected_servers = select_help_servers(&cfg, request.server.as_deref())?;
     let discovery = discover_tools_with_auto_refresh(store, upstream_manager, &selected_servers)
@@ -1095,7 +1229,6 @@ async fn gambi_help_output(
             upstream_name: selected.upstream_name.clone(),
             description,
             policy_level: policy.level.as_str().to_string(),
-            policy_source: policy.source.as_str().to_string(),
             input_schema: selected.tool.input_schema.as_ref().clone(),
             output_schema: selected
                 .tool
@@ -1112,11 +1245,12 @@ async fn gambi_help_output(
         let discovered = by_server.get(&server.name).cloned().unwrap_or_default();
         let tool_count = discovered.len();
         let tools = summarize_tools_for_exposure_mode(&cfg, &server, &discovered);
+        let instruction = cfg.resolve_server_instruction(&upstream_instructions, &server.name);
         servers.push(HelpServerOutput {
             name: server.name.clone(),
             url: server.url.clone(),
-            exposure_mode: server.exposure_mode.as_str().to_string(),
             tool_count,
+            instruction: instruction.instruction,
             tools,
         });
     }
@@ -1132,12 +1266,11 @@ async fn gambi_help_output(
 
     let usage = "Use gambi in execute-only mode:\n\
 1) Call gambi_help to inspect servers/tools.\n\
-2) If you need full metadata, call gambi_help with server/tool.\n\
-3) Run workflows through gambi_execute first (safe policy mode).\n\
-4) If response includes ESCALATION_REQUIRED, re-run with gambi_execute_escalated.\n\
-5) Safe heuristic: names starting with get/list/search/lookup/fetch OR descriptions starting with get.\n\
-6) Only tools marked active in gambi admin are exposed.\n\
-Direct namespaced upstream tool calls are disabled."
+2) Inspect each server's instruction field for usage guidance; if you need full tool metadata, call gambi_help with server/tool.\n\
+3) In gambi_execute, call upstream tools with namespaced Python dot syntax only: server.tool(keyword=value).\n\
+4) Do not use helper functions like call_tool(...) or tool(...); they are not available.\n\
+5) Run workflows through gambi_execute first (safe policy mode).\n\
+6) If response includes ESCALATION_REQUIRED, re-run with gambi_execute_escalated."
         .to_string();
 
     Ok(Json(HelpResponse {
@@ -1232,7 +1365,6 @@ fn summarize_tools_for_exposure_mode(
                 namespaced_name: tool.namespaced_name.clone(),
                 description,
                 policy_level: policy.level.as_str().to_string(),
-                policy_source: policy.source.as_str().to_string(),
             }
         })
         .collect()
@@ -1280,14 +1412,114 @@ async fn discover_tools_with_auto_refresh(
     upstream_manager: &upstream::UpstreamManager,
     servers: &[crate::config::ServerConfig],
 ) -> Result<upstream::DiscoveryResult> {
+    discover_with_auto_refresh(
+        store,
+        upstream_manager,
+        servers,
+        "tool",
+        discover_tools_with_headers,
+    )
+    .await
+}
+
+async fn discover_prompts_with_auto_refresh(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    servers: &[crate::config::ServerConfig],
+) -> Result<upstream::PromptDiscoveryResult> {
+    discover_with_auto_refresh(
+        store,
+        upstream_manager,
+        servers,
+        "prompt",
+        discover_prompts_with_headers,
+    )
+    .await
+}
+
+async fn discover_resources_with_auto_refresh(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    servers: &[crate::config::ServerConfig],
+) -> Result<upstream::ResourceDiscoveryResult> {
+    discover_with_auto_refresh(
+        store,
+        upstream_manager,
+        servers,
+        "resource",
+        discover_resources_with_headers,
+    )
+    .await
+}
+
+type DiscoverFn<T> = for<'a> fn(
+    &'a upstream::UpstreamManager,
+    &'a [crate::config::ServerConfig],
+    &'a upstream::UpstreamAuthHeaders,
+) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+fn discover_tools_with_headers<'a>(
+    manager: &'a upstream::UpstreamManager,
+    servers: &'a [crate::config::ServerConfig],
+    auth_headers: &'a upstream::UpstreamAuthHeaders,
+) -> Pin<Box<dyn Future<Output = Result<upstream::DiscoveryResult>> + Send + 'a>> {
+    Box::pin(manager.discover_tools_from_servers(servers, auth_headers))
+}
+
+fn discover_prompts_with_headers<'a>(
+    manager: &'a upstream::UpstreamManager,
+    servers: &'a [crate::config::ServerConfig],
+    auth_headers: &'a upstream::UpstreamAuthHeaders,
+) -> Pin<Box<dyn Future<Output = Result<upstream::PromptDiscoveryResult>> + Send + 'a>> {
+    Box::pin(manager.discover_prompts_from_servers(servers, auth_headers))
+}
+
+fn discover_resources_with_headers<'a>(
+    manager: &'a upstream::UpstreamManager,
+    servers: &'a [crate::config::ServerConfig],
+    auth_headers: &'a upstream::UpstreamAuthHeaders,
+) -> Pin<Box<dyn Future<Output = Result<upstream::ResourceDiscoveryResult>> + Send + 'a>> {
+    Box::pin(manager.discover_resources_from_servers(servers, auth_headers))
+}
+
+trait HasDiscoveryFailures {
+    fn failures(&self) -> &[upstream::DiscoveryFailure];
+}
+
+impl HasDiscoveryFailures for upstream::DiscoveryResult {
+    fn failures(&self) -> &[upstream::DiscoveryFailure] {
+        &self.failures
+    }
+}
+
+impl HasDiscoveryFailures for upstream::PromptDiscoveryResult {
+    fn failures(&self) -> &[upstream::DiscoveryFailure] {
+        &self.failures
+    }
+}
+
+impl HasDiscoveryFailures for upstream::ResourceDiscoveryResult {
+    fn failures(&self) -> &[upstream::DiscoveryFailure] {
+        &self.failures
+    }
+}
+
+async fn discover_with_auto_refresh<T>(
+    store: &ConfigStore,
+    upstream_manager: &upstream::UpstreamManager,
+    servers: &[crate::config::ServerConfig],
+    discovery_kind: &'static str,
+    discover: DiscoverFn<T>,
+) -> Result<T>
+where
+    T: HasDiscoveryFailures,
+{
     let tokens: TokenState = store.load_tokens_async().await?;
     let auth_headers = upstream::auth_headers_from_token_state(&tokens);
-    let mut discovered = upstream_manager
-        .discover_tools_from_servers(servers, &auth_headers)
-        .await?;
+    let mut discovered = discover(upstream_manager, servers, &auth_headers).await?;
 
     let auth_failures: BTreeSet<String> = discovered
-        .failures
+        .failures()
         .iter()
         .filter(|failure| looks_like_auth_failure(&failure.message))
         .map(|failure| failure.server_name.clone())
@@ -1308,6 +1540,7 @@ async fn discover_tools_with_auto_refresh(
                 warn!(
                     error = %err,
                     server = %server_name,
+                    discovery_kind,
                     "upstream reported auth failure during MCP discovery and oauth refresh failed"
                 );
             }
@@ -1318,111 +1551,7 @@ async fn discover_tools_with_auto_refresh(
         upstream_manager.invalidate_discovery_cache().await;
         let tokens: TokenState = store.load_tokens_async().await?;
         let auth_headers = upstream::auth_headers_from_token_state(&tokens);
-        discovered = upstream_manager
-            .discover_tools_from_servers(servers, &auth_headers)
-            .await?;
-    }
-
-    Ok(discovered)
-}
-
-async fn discover_prompts_with_auto_refresh(
-    store: &ConfigStore,
-    upstream_manager: &upstream::UpstreamManager,
-    servers: &[crate::config::ServerConfig],
-) -> Result<upstream::PromptDiscoveryResult> {
-    let tokens: TokenState = store.load_tokens_async().await?;
-    let auth_headers = upstream::auth_headers_from_token_state(&tokens);
-    let mut discovered = upstream_manager
-        .discover_prompts_from_servers(servers, &auth_headers)
-        .await?;
-
-    let auth_failures: BTreeSet<String> = discovered
-        .failures
-        .iter()
-        .filter(|failure| looks_like_auth_failure(&failure.message))
-        .map(|failure| failure.server_name.clone())
-        .collect();
-    if auth_failures.is_empty() {
-        return Ok(discovered);
-    }
-
-    let mut refreshed_any = false;
-    for server_name in auth_failures {
-        if !server_is_http(servers, &server_name) {
-            continue;
-        }
-        match refresh_auth_for_server(store, &server_name).await {
-            Ok(true) => refreshed_any = true,
-            Ok(false) => {}
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    server = %server_name,
-                    "upstream reported auth failure during MCP prompt discovery and oauth refresh failed"
-                );
-            }
-        }
-    }
-
-    if refreshed_any {
-        upstream_manager.invalidate_discovery_cache().await;
-        let tokens: TokenState = store.load_tokens_async().await?;
-        let auth_headers = upstream::auth_headers_from_token_state(&tokens);
-        discovered = upstream_manager
-            .discover_prompts_from_servers(servers, &auth_headers)
-            .await?;
-    }
-
-    Ok(discovered)
-}
-
-async fn discover_resources_with_auto_refresh(
-    store: &ConfigStore,
-    upstream_manager: &upstream::UpstreamManager,
-    servers: &[crate::config::ServerConfig],
-) -> Result<upstream::ResourceDiscoveryResult> {
-    let tokens: TokenState = store.load_tokens_async().await?;
-    let auth_headers = upstream::auth_headers_from_token_state(&tokens);
-    let mut discovered = upstream_manager
-        .discover_resources_from_servers(servers, &auth_headers)
-        .await?;
-
-    let auth_failures: BTreeSet<String> = discovered
-        .failures
-        .iter()
-        .filter(|failure| looks_like_auth_failure(&failure.message))
-        .map(|failure| failure.server_name.clone())
-        .collect();
-    if auth_failures.is_empty() {
-        return Ok(discovered);
-    }
-
-    let mut refreshed_any = false;
-    for server_name in auth_failures {
-        if !server_is_http(servers, &server_name) {
-            continue;
-        }
-        match refresh_auth_for_server(store, &server_name).await {
-            Ok(true) => refreshed_any = true,
-            Ok(false) => {}
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    server = %server_name,
-                    "upstream reported auth failure during MCP resource discovery and oauth refresh failed"
-                );
-            }
-        }
-    }
-
-    if refreshed_any {
-        upstream_manager.invalidate_discovery_cache().await;
-        let tokens: TokenState = store.load_tokens_async().await?;
-        let auth_headers = upstream::auth_headers_from_token_state(&tokens);
-        discovered = upstream_manager
-            .discover_resources_from_servers(servers, &auth_headers)
-            .await?;
+        discovered = discover(upstream_manager, servers, &auth_headers).await?;
     }
 
     Ok(discovered)
@@ -1513,11 +1642,13 @@ fn looks_like_auth_failure(message: &str) -> bool {
 mod tests {
     use std::sync::Arc;
 
+    use rmcp::ServerHandler;
     use rmcp::model::{ErrorCode, PaginatedRequestParams, Tool};
     use serde_json::{Map, Value};
 
     use super::{
-        McpServer, looks_like_auth_failure, normalize_tool_schema_for_clients, paginate_items,
+        McpServer, list_servers_output, looks_like_auth_failure, normalize_tool_schema_for_clients,
+        paginate_items,
     };
 
     #[test]
@@ -1560,6 +1691,49 @@ mod tests {
         assert!(!names.iter().any(|name| name == "gambi_execute_escalated"));
         assert!(names.iter().any(|name| name == "gambi_list_servers"));
         assert!(names.iter().any(|name| name == "gambi_list_upstream_tools"));
+    }
+
+    #[test]
+    fn initialize_instructions_include_server_instruction_overrides() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = crate::config::ConfigStore::with_base_dir(temp.path().join("gambi"));
+        store
+            .update(|cfg| {
+                cfg.add_server(crate::config::ServerConfig {
+                    name: "atlassian".to_string(),
+                    url: "https://mcp.atlassian.com/v1/sse".to_string(),
+                    oauth: None,
+                    transport: crate::config::TransportMode::Auto,
+                    exposure_mode: crate::config::ExposureMode::Compact,
+                    enabled: true,
+                })?;
+                cfg.set_server_instruction_override(
+                    "atlassian",
+                    "Use Jira and Confluence tools for engineering operations",
+                )?;
+                Ok(())
+            })
+            .expect("seed config");
+
+        let server = McpServer::new(store, crate::upstream::UpstreamManager::new(), true);
+        let info = <McpServer as ServerHandler>::get_info(&server);
+        let instructions = info
+            .instructions
+            .as_ref()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+
+        assert!(instructions.contains("Configured servers (effective instruction preview):"));
+        assert!(instructions.contains("- atlassian (enabled, override):"));
+        assert!(instructions.contains("Use Jira and Confluence tools for engineering operations"));
+    }
+
+    #[test]
+    fn initialize_instruction_preview_truncates_long_text() {
+        let input = format!("{} keep tail", "a".repeat(1200));
+        let summary = super::summarize_instruction_for_initialize(&input);
+        assert!(summary.len() <= super::INITIALIZE_INSTRUCTION_PREVIEW_LIMIT + 3);
+        assert!(summary.ends_with('…'));
     }
 
     #[test]
@@ -1661,5 +1835,69 @@ mod tests {
             .and_then(Value::as_object)
             .expect("result schema should be object after normalization");
         assert!(result_schema.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_servers_output_includes_instruction_override_and_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = crate::config::ConfigStore::with_base_dir(temp.path().join("gambi"));
+        store
+            .update(|cfg| {
+                cfg.add_server(crate::config::ServerConfig {
+                    name: "port".to_string(),
+                    url: "https://example.com/mcp".to_string(),
+                    oauth: None,
+                    transport: Default::default(),
+                    exposure_mode: Default::default(),
+                    enabled: true,
+                })?;
+                cfg.set_server_instruction_override("port", "Use overridden workflows")
+            })
+            .expect("config setup should succeed");
+
+        let output = list_servers_output(&store, &crate::upstream::UpstreamManager::new())
+            .await
+            .expect("list servers should succeed");
+        let listed = output
+            .0
+            .servers
+            .into_iter()
+            .find(|server| server.name == "port")
+            .expect("server should be present");
+        assert_eq!(
+            listed.instruction.as_deref(),
+            Some("Use overridden workflows")
+        );
+        assert_eq!(listed.instruction_source, "override");
+    }
+
+    #[tokio::test]
+    async fn list_servers_output_marks_none_instruction_source_when_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = crate::config::ConfigStore::with_base_dir(temp.path().join("gambi"));
+        store
+            .update(|cfg| {
+                cfg.add_server(crate::config::ServerConfig {
+                    name: "github".to_string(),
+                    url: "https://example.com/mcp".to_string(),
+                    oauth: None,
+                    transport: Default::default(),
+                    exposure_mode: Default::default(),
+                    enabled: true,
+                })
+            })
+            .expect("config setup should succeed");
+
+        let output = list_servers_output(&store, &crate::upstream::UpstreamManager::new())
+            .await
+            .expect("list servers should succeed");
+        let listed = output
+            .0
+            .servers
+            .into_iter()
+            .find(|server| server.name == "github")
+            .expect("server should be present");
+        assert!(listed.instruction.is_none());
+        assert_eq!(listed.instruction_source, "none");
     }
 }
