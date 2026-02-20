@@ -91,6 +91,42 @@ test.describe("admin UI", () => {
           return payload ? payload.tools.includes("gambi_execute") : null;
         })
         .toBe(false);
+
+      await page.locator("#server-name").fill("fixture-local");
+      await expect(page.locator("#server-name")).toBeFocused();
+      const selectedBeforeRefresh = await page.evaluate(() => {
+        const input = document.querySelector("#server-name");
+        if (!(input instanceof HTMLInputElement)) return null;
+        input.focus();
+        input.setSelectionRange(0, Math.min(6, input.value.length));
+        return [input.selectionStart || 0, input.selectionEnd || 0];
+      });
+      expect(selectedBeforeRefresh).toEqual([0, 6]);
+      await page.waitForTimeout(3500);
+      await expect(page.locator("#server-name")).toBeFocused();
+      await expect(page.locator("#server-name")).toHaveValue("fixture-local");
+      const selectedAfterRefresh = await page.evaluate(() => {
+        const input = document.querySelector("#server-name");
+        if (!(input instanceof HTMLInputElement)) return null;
+        return [input.selectionStart || 0, input.selectionEnd || 0];
+      });
+      expect(selectedAfterRefresh).toEqual(selectedBeforeRefresh);
+
+      await page.getByRole("button", { name: "Effective" }).click();
+      await expect(page.locator("#tab-effective")).toBeVisible();
+      await expect(page.locator("#effective-view")).toContainText(
+        "initialize.instructions",
+      );
+      await expect
+        .poll(async () => {
+          const payload = await page.evaluate(async () => {
+            const response = await fetch("/effective");
+            if (!response.ok) return null;
+            return response.json();
+          });
+          return payload ? payload.mcp_tools_list?.tools?.length : null;
+        })
+        .toBeGreaterThanOrEqual(3);
     } finally {
       await gambi.stop();
       await fs.rm(configHome, { recursive: true, force: true });
@@ -192,6 +228,91 @@ test.describe("admin UI", () => {
           defaultMode: "none",
           fixtureEchoActive: true,
           fixtureEchoDesc: overrideText,
+        });
+    } finally {
+      await gambi.stop();
+      await fs.rm(configHome, { recursive: true, force: true });
+    }
+  });
+
+  test("supports server instruction overrides with save/restore flow", async ({ page }) => {
+    const binPath = resolveGambiBin();
+    if (!(await ensurePathExists(binPath))) {
+      throw new Error(
+        `gambi binary not found at ${binPath}; run 'cargo build --bin gambi' first`,
+      );
+    }
+
+    const configHome = await fs.mkdtemp(
+      path.join(os.tmpdir(), "gambi-admin-ui-server-instruction-"),
+    );
+    const gambi = await startGambi({ binPath, configHome, execEnabled: false });
+    const overrideText = "Use fixture MCP for test-only diagnostics";
+    try {
+      await page.goto(gambi.baseUrl, { waitUntil: "domcontentloaded" });
+      await expect(page.getByRole("heading", { name: "gambi admin" })).toBeVisible();
+
+      await addFixtureServer(page, gambi.fixtureServerUrl);
+      const fixtureCard = page.locator("#tab-servers .server-card", {
+        hasText: "fixture",
+      });
+      await expect(fixtureCard).toBeVisible();
+      await expect
+        .poll(async () => {
+          const text = await fixtureCard
+            .locator(".server-instruction-value")
+            .textContent();
+          return text || "";
+        })
+        .toContain("fixture progress MCP server");
+
+      await fixtureCard.locator('[data-action="edit-server-instruction"]').click();
+      const instructionEditor = page.locator("#edit-server-instruction-text");
+      await instructionEditor.fill("Draft preserved across refresh");
+      await instructionEditor.focus();
+      await expect(instructionEditor).toBeFocused();
+      await page.waitForTimeout(3500);
+      await expect(instructionEditor).toBeFocused();
+      await expect(instructionEditor).toHaveValue("Draft preserved across refresh");
+
+      await page.fill("#edit-server-instruction-text", "   ");
+      await expect(page.locator('[data-action="save-server-instruction"]')).toBeDisabled();
+
+      await page.fill("#edit-server-instruction-text", overrideText);
+      await expect(page.locator('[data-action="save-server-instruction"]')).toBeEnabled();
+      await page.click('[data-action="save-server-instruction"]');
+
+      await expect
+        .poll(async () => {
+          const payload = await readServersPayload(page);
+          if (!payload) return null;
+          return {
+            override: payload.server_instruction_overrides?.fixture ?? null,
+            effective: payload.effective_server_instructions?.fixture ?? null,
+            source: payload.server_instruction_sources?.fixture ?? null,
+          };
+        })
+        .toEqual({
+          override: overrideText,
+          effective: overrideText,
+          source: "override",
+        });
+
+      await page.click('[data-action="restore-server-instruction"][data-server="fixture"]');
+      await expect
+        .poll(async () => {
+          const payload = await readServersPayload(page);
+          if (!payload) return null;
+          return {
+            hasOverride: Boolean(payload.server_instruction_overrides?.fixture),
+            effective: payload.effective_server_instructions?.fixture ?? null,
+            source: payload.server_instruction_sources?.fixture ?? null,
+          };
+        })
+        .toEqual({
+          hasOverride: false,
+          effective: "fixture progress MCP server",
+          source: "upstream",
         });
     } finally {
       await gambi.stop();
