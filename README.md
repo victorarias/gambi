@@ -28,6 +28,8 @@ That kind of duct-tape-and-ingenuity solution has a name in Brazilian Portuguese
 - **Execution policy controls** — classify each server catalog as `heuristic`, `all-safe`, `all-escalated`, or `custom`; each tool shows a `safe`/`escalated` badge and a policy-source pill (`heuristic`, `override`, `system`)
 - **OAuth handling** — PKCE, token refresh/rotation, degraded-state reporting — all managed for you
 - **Tool description overrides** — click any tool description to edit it inline; save or cancel, compare diffs, or restore the original
+- **Server instruction overrides** — surface upstream MCP `instructions` in `gambi_help`/admin, override them inline, and restore upstream defaults anytime
+  - Override values are validated and capped at 8192 characters
 
 ![gambi admin tools tab](docs/screenshots/admin-overrides.png)
 
@@ -155,6 +157,7 @@ The admin panel runs on loopback only (`http://127.0.0.1:3333`) and is organized
 - Activate / Deactivate toggle to enable or disable a server without removing it
 - Remove button (requires double-click confirmation)
 - Auth status chip and a summary line (`state=enabled · exposure=passthrough · tools=all · policy=heuristic`)
+- Server instruction section: click to edit/save override, see source (`upstream`/`override`/`none`), diff override vs upstream, and restore
 
 **Tools tab** — lists every tool your agent can access, with filters by name/description, server, and policy level. Each tool row shows:
 - `active` / `inactive` toggle for per-tool activation overrides
@@ -166,7 +169,7 @@ The admin panel runs on loopback only (`http://127.0.0.1:3333`) and is organized
 
 Every tab has a "json" toggle to see the raw API response.
 
-API endpoints are also available directly: `/health`, `/status`, `/servers`, `/tools`, `/logs`, `/auth/status`, `/config/export`, `/config/import`, and more.
+API endpoints are also available directly: `/health`, `/status`, `/servers`, `/tools`, `/logs`, `/server-instructions`, `/auth/status`, `/config/export`, `/config/import`, and more.
 
 ## CLI reference
 
