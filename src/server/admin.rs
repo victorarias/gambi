@@ -84,6 +84,10 @@ struct ServersResponse {
     server_tool_activation_modes: BTreeMap<String, ToolActivationMode>,
     tool_activation_overrides: BTreeMap<String, BTreeMap<String, bool>>,
     server_tool_policy_modes: BTreeMap<String, ToolPolicyMode>,
+    server_instruction_overrides: BTreeMap<String, String>,
+    upstream_server_instructions: BTreeMap<String, String>,
+    effective_server_instructions: BTreeMap<String, String>,
+    server_instruction_sources: BTreeMap<String, String>,
     tool_description_overrides: BTreeMap<String, BTreeMap<String, String>>,
     tool_policy_overrides: BTreeMap<String, BTreeMap<String, ToolPolicyLevel>>,
 }
@@ -95,13 +99,13 @@ struct ToolsResponse {
     failures: Vec<ToolDiscoveryFailure>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ToolDiscoveryFailure {
     server: String,
     error: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ToolDetail {
     name: String,
     description: String,
@@ -115,6 +119,31 @@ struct ToolDetail {
     activation_source: String,
     policy_level: String,
     policy_source: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EffectiveOutputResponse {
+    mcp_initialize: serde_json::Value,
+    mcp_tools_list: serde_json::Value,
+    gambi_list_servers: serde_json::Value,
+    gambi_list_upstream_tools: serde_json::Value,
+    gambi_help: serde_json::Value,
+    tool_details: Vec<ToolDetail>,
+    discovery_failures: Vec<ToolDiscoveryFailure>,
+    impacted_servers: Vec<EffectiveServerImpact>,
+    auth_statuses: Vec<AuthServerStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct EffectiveServerImpact {
+    server: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery_error: Option<String>,
+    oauth_configured: bool,
+    has_token: bool,
+    degraded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,6 +171,17 @@ struct ToolDescriptionOverrideRequest {
     server: String,
     tool: String,
     description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerInstructionOverrideRequest {
+    server: String,
+    instruction: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveServerInstructionOverrideRequest {
+    server: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +308,25 @@ impl IntoResponse for ApiError {
     }
 }
 
+fn is_user_config_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("unknown server")
+        || msg.contains("already exists")
+        || msg.contains("cannot be empty")
+        || msg.contains("exceeds max length")
+        || msg.contains("invalid")
+        || msg.contains("unsupported")
+        || msg.contains("not found")
+}
+
+fn map_config_mutation_error(action: &str, err: anyhow::Error) -> ApiError {
+    if is_user_config_error(&err) {
+        ApiError::bad_request(format!("failed to {action}: {err}"))
+    } else {
+        ApiError::internal(format!("failed to {action}: {err}"))
+    }
+}
+
 pub async fn run(
     bind: AdminBindOptions,
     store: ConfigStore,
@@ -325,7 +384,16 @@ pub async fn run(
         .route("/servers/{name}/enabled", post(update_server_enabled))
         .route("/servers/{name}", delete(remove_server))
         .route("/tools", get(tools))
+        .route("/effective", get(effective))
         .route("/tool-activation", post(set_tool_activation_override))
+        .route(
+            "/server-instructions",
+            post(set_server_instruction_override),
+        )
+        .route(
+            "/server-instructions/remove",
+            post(remove_server_instruction_override),
+        )
         .route("/tool-descriptions", post(set_tool_description_override))
         .route(
             "/tool-descriptions/remove",
@@ -439,6 +507,7 @@ async fn root() -> Html<&'static str> {
 
     .status-strip { position: sticky; top: 52px; z-index: 18; background: var(--surface); border-top: 1px dashed rgba(255,255,255,0.04); border-bottom: 1px dashed var(--border); padding: 8px 24px; display: flex; gap: 8px; flex-wrap: wrap; }
     .status-chip { font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 100px; border: 1px solid var(--border); background: var(--raised); color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; }
+    .effective-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
 
     .err-banner { display: none; padding: 8px 24px; background: var(--red-bg); border-bottom: 1px solid rgba(248,113,113,0.15); }
     .err-banner.show { display: flex; align-items: center; gap: 8px; }
@@ -492,6 +561,10 @@ async fn root() -> Html<&'static str> {
     .server-controls { display: grid; grid-template-columns: 1fr 1fr 1fr auto auto auto; gap: 8px; align-items: center; }
     .auth-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-family: var(--mono); font-size: 11px; color: var(--text-2); }
     .chip-auth { display: inline-flex; align-items: center; gap: 6px; }
+    .server-instruction { display: grid; gap: 6px; padding-top: 6px; border-top: 1px dashed var(--border); }
+    .server-instruction-value { font-family: var(--mono); font-size: 11px; color: var(--text-2); cursor: pointer; border: 1px solid transparent; border-radius: var(--r-sm); padding: 6px; margin: -6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .server-instruction-value:hover { border-color: var(--border); background: rgba(255,255,255,0.01); }
+    .server-instruction-actions { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
     input, select, textarea { font-family: var(--mono); font-size: 12px; padding: 7px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); outline: none; }
     input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(212,122,90,0.15); }
@@ -541,6 +614,7 @@ async fn root() -> Html<&'static str> {
     .fail { padding: 6px 8px; background: var(--red-bg); border-left: 2px solid var(--red); border-radius: 0 var(--r-sm) var(--r-sm) 0; font-family: var(--mono); font-size: 11px; color: var(--red); margin-bottom: 8px; }
 
     .logs-pre { max-height: 72vh; min-height: 260px; margin: 0; }
+    .effective-pre { max-height: 260px; min-height: 0; margin: 0; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0; }
     @media (max-width: 960px) {
       .server-add { grid-template-columns: 1fr; }
@@ -566,6 +640,7 @@ async fn root() -> Html<&'static str> {
     <div class="tabs">
       <button class="tab-btn" data-tab="servers">Servers</button>
       <button class="tab-btn" data-tab="tools">Tools</button>
+      <button class="tab-btn" data-tab="effective">Effective</button>
       <button class="tab-btn" data-tab="logs">Logs</button>
     </div>
 
@@ -623,6 +698,15 @@ async fn root() -> Html<&'static str> {
       </div>
     </section>
 
+    <section class="panel hidden" id="tab-effective">
+      <div class="ph"><h2>Effective Output</h2><button class="raw-btn" data-raw-toggle="effective">json</button></div>
+      <div class="pb">
+        <div id="effective-summary" class="effective-summary"></div>
+        <div id="effective-view" class="server-list"></div>
+        <pre id="effective-raw" class="hidden">loading...</pre>
+      </div>
+    </section>
+
     <section class="panel hidden" id="tab-logs">
       <div class="ph"><h2>Logs</h2><button class="raw-btn" data-raw-toggle="logs">json</button></div>
       <div class="pb">
@@ -637,6 +721,7 @@ async fn root() -> Html<&'static str> {
   <script>
     const TOOL_REFRESH_INTERVAL_MS = 15000;
     const REFRESH_INTERVAL_MS = 3000;
+    const SERVER_INSTRUCTION_MAX_LENGTH = 8192;
     let refreshInFlight = false;
     let clearRemoveConfirmTimer = null;
 
@@ -645,17 +730,32 @@ async fn root() -> Html<&'static str> {
       serverActivationModes: {},
       toolActivationOverrides: {},
       serverPolicyModes: {},
+      serverInstructionOverrides: {},
+      upstreamServerInstructions: {},
+      effectiveServerInstructions: {},
+      serverInstructionSources: {},
       descriptionOverrides: {},
       authStatuses: [],
       toolsPayload: null,
+      effectivePayload: null,
       toolsRefreshAtMs: 0,
       latestLogsPayload: null,
+      latestStatusPayload: null,
       logsDirty: false,
+      statusBarDirty: false,
+      serversDirty: false,
+      statusStripDirty: false,
+      toolFiltersDirty: false,
+      toolsDirty: false,
+      effectiveDirty: false,
       activeTab: 'servers',
-      rawVisible: { servers: false, tools: false, logs: false },
+      rawVisible: { servers: false, tools: false, effective: false, logs: false },
       filterText: '',
       filterServer: 'all',
       filterPolicy: 'all',
+      editingServerInstructionServer: null,
+      editingServerInstructionDraft: '',
+      showServerInstructionDiff: false,
       editingToolKey: null,
       editingDraft: '',
       showDiff: false,
@@ -680,7 +780,7 @@ async fn root() -> Html<&'static str> {
 
     function readHashTab() {
       const hash = window.location.hash.replace('#', '').trim();
-      if (hash === 'servers' || hash === 'tools' || hash === 'logs') {
+      if (hash === 'servers' || hash === 'tools' || hash === 'effective' || hash === 'logs') {
         return hash;
       }
       return 'servers';
@@ -689,7 +789,7 @@ async fn root() -> Html<&'static str> {
     function setActiveTab(tab) {
       state.activeTab = tab;
       window.location.hash = tab;
-      const tabs = ['servers', 'tools', 'logs'];
+      const tabs = ['servers', 'tools', 'effective', 'logs'];
       for (const t of tabs) {
         const btn = document.querySelector('.tab-btn[data-tab="' + t + '"]');
         const pane = document.getElementById('tab-' + t);
@@ -726,11 +826,73 @@ async fn root() -> Html<&'static str> {
       return selectionTouchesElement(logs) || selectionTouchesElement(logsRaw);
     }
 
+    function hasNonCollapsedSelection() {
+      const selection = window.getSelection();
+      return Boolean(selection && selection.rangeCount > 0 && !selection.isCollapsed);
+    }
+
+    function isEditableElement(element) {
+      if (!(element instanceof Element)) return false;
+      const tag = element.tagName.toLowerCase();
+      return tag === 'input' || tag === 'textarea' || tag === 'select' || element.isContentEditable;
+    }
+
+    function isInteractingWithin(element) {
+      if (!element) return false;
+      const active = document.activeElement;
+      if (active && element.contains(active) && isEditableElement(active)) {
+        return true;
+      }
+      return hasNonCollapsedSelection() && selectionTouchesElement(element);
+    }
+
     function renderLogsFromState() {
       const payload = state.latestLogsPayload || {};
       document.getElementById('logs-raw').textContent = JSON.stringify(payload, null, 2);
       document.getElementById('logs').textContent = (payload.logs || []).join('\n');
       state.logsDirty = false;
+    }
+
+    function flushDeferredRenders() {
+      if (refreshInFlight) return;
+      if (state.logsDirty && !isSelectingLogsText()) {
+        renderLogsFromState();
+      }
+
+      if (state.statusBarDirty && !isEditableElement(document.activeElement)) {
+        renderStatusBar(state.latestStatusPayload);
+        state.statusBarDirty = false;
+      }
+
+      const statusStrip = document.getElementById('status-strip');
+      if (state.statusStripDirty && !isInteractingWithin(statusStrip)) {
+        renderStatusStrip();
+        state.statusStripDirty = false;
+      }
+
+      const serversTab = document.getElementById('tab-servers');
+      if (state.serversDirty && !isInteractingWithin(serversTab)) {
+        renderServersView();
+        state.serversDirty = false;
+      }
+
+      const toolToolbar = document.querySelector('#tab-tools .tool-toolbar');
+      if (state.toolFiltersDirty && !isInteractingWithin(toolToolbar)) {
+        renderToolFilters();
+        state.toolFiltersDirty = false;
+      }
+
+      const toolsTab = document.getElementById('tab-tools');
+      if (state.toolsDirty && !isInteractingWithin(toolsTab)) {
+        renderToolsView();
+        state.toolsDirty = false;
+      }
+
+      const effectiveTab = document.getElementById('tab-effective');
+      if (state.effectiveDirty && !isInteractingWithin(effectiveTab)) {
+        renderEffectiveView();
+        state.effectiveDirty = false;
+      }
     }
 
     function setError(message) {
@@ -763,15 +925,23 @@ async fn root() -> Html<&'static str> {
 
     function shouldRefreshTools(forceTools) {
       if (forceTools) return true;
-      if (!state.toolsPayload) return true;
+      if (!state.toolsPayload || !state.effectivePayload) return true;
       return Date.now() - state.toolsRefreshAtMs >= TOOL_REFRESH_INTERVAL_MS;
     }
 
     function captureEditingDraftFromDom() {
-      if (!state.editingToolKey) return;
-      const textarea = document.getElementById('edit-desc-text');
-      if (!textarea) return;
-      state.editingDraft = textarea.value || '';
+      if (state.editingToolKey) {
+        const textarea = document.getElementById('edit-desc-text');
+        if (textarea) {
+          state.editingDraft = textarea.value || '';
+        }
+      }
+      if (state.editingServerInstructionServer) {
+        const textarea = document.getElementById('edit-server-instruction-text');
+        if (textarea) {
+          state.editingServerInstructionDraft = textarea.value || '';
+        }
+      }
     }
 
     function renderStatusBar(p) {
@@ -855,6 +1025,14 @@ async fn root() -> Html<&'static str> {
         const authStatus = statusChipForAuth(auth, enabled);
         const toggleLabel = enabled ? 'Deactivate' : 'Activate';
         const wantsConfirm = state.confirmRemoveServer === s.name;
+        const instructionOverride = serverInstructionOverride(s.name);
+        const upstreamInstruction = upstreamServerInstruction(s.name);
+        const effectiveInstruction = effectiveServerInstruction(s.name);
+        const instructionSource = serverInstructionSource(s.name);
+        const isEditingInstruction = state.editingServerInstructionServer === s.name;
+        const canSaveInstruction = Boolean(
+          state.editingServerInstructionDraft && state.editingServerInstructionDraft.trim()
+        );
         h += '<article class="server-card">';
         h += '<div class="server-head"><div class="server-title"><span class="dot ' + authStatus.dot + '"></span><span class="server-name">' + esc(s.name) + '</span></div><span class="server-url">' + esc(s.url) + '</span></div>';
         h += '<div class="server-controls">';
@@ -872,6 +1050,31 @@ async fn root() -> Html<&'static str> {
         h += '<button type="button" class="btn-d" data-action="remove-server" data-server="' + escAttrHtml(s.name) + '">' + (wantsConfirm ? 'Confirm Remove' : 'Remove') + '</button>';
         h += '</div>';
         h += '<div class="auth-line"><span class="chip-auth"><span class="dot ' + authStatus.dot + '"></span>' + esc(authStatus.text) + '</span><span class="pill pill-src">state=' + (enabled ? 'enabled' : 'disabled') + ' · exposure=' + esc(exposure) + ' · tools=' + esc(toolDefault) + ' · policy=' + esc(policy) + '</span></div>';
+        h += '<div class="server-instruction">';
+        h += '<span class="pill pill-src">instruction</span>';
+        if (isEditingInstruction) {
+          h += '<textarea id="edit-server-instruction-text" placeholder="Describe how this server should be used...">' + esc(state.editingServerInstructionDraft) + '</textarea>';
+          h += '<div class="server-instruction-actions">';
+          h += '<button type="button" data-action="save-server-instruction" data-server="' + escAttrHtml(s.name) + '"' + (canSaveInstruction ? '' : ' disabled') + '>Save Override</button>';
+          h += '<button type="button" class="btn-quiet" data-action="cancel-server-instruction">Cancel</button>';
+          if (instructionOverride !== null && upstreamInstruction !== null) {
+            h += '<button type="button" class="btn-quiet" data-action="toggle-server-instruction-diff">' + (state.showServerInstructionDiff ? 'Hide Diff' : 'Show Diff') + '</button>';
+          }
+          h += '</div>';
+          if (state.showServerInstructionDiff && instructionOverride !== null && upstreamInstruction !== null) {
+            h += '<div class="desc-diff"><div class="diff-old">- ' + esc(upstreamInstruction) + '</div><div class="diff-new">+ ' + esc(state.editingServerInstructionDraft) + '</div></div>';
+          }
+        } else {
+          const instructionText = effectiveInstruction || 'No instruction set. Click to add an override.';
+          h += '<div class="server-instruction-value" data-action="edit-server-instruction" data-server="' + escAttrHtml(s.name) + '">' + esc(instructionText) + '</div>';
+          h += '<div class="server-instruction-actions">';
+          h += '<span class="pill ' + (instructionSource === 'override' ? 'pill-override' : 'pill-src') + '">' + esc(instructionSource) + '</span>';
+          if (instructionOverride !== null) {
+            h += '<button type="button" class="btn-quiet" data-action="restore-server-instruction" data-server="' + escAttrHtml(s.name) + '">Restore</button>';
+          }
+          h += '</div>';
+        }
+        h += '</div>';
         h += '</article>';
       }
       v.innerHTML = h;
@@ -910,6 +1113,26 @@ async fn root() -> Html<&'static str> {
       if (!byServer) return null;
       const value = byServer[tool];
       return typeof value === 'string' ? value : null;
+    }
+
+    function serverInstructionOverride(server) {
+      const value = state.serverInstructionOverrides && state.serverInstructionOverrides[server];
+      return typeof value === 'string' ? value : null;
+    }
+
+    function upstreamServerInstruction(server) {
+      const value = state.upstreamServerInstructions && state.upstreamServerInstructions[server];
+      return typeof value === 'string' ? value : null;
+    }
+
+    function effectiveServerInstruction(server) {
+      const value = state.effectiveServerInstructions && state.effectiveServerInstructions[server];
+      return typeof value === 'string' ? value : '';
+    }
+
+    function serverInstructionSource(server) {
+      const value = state.serverInstructionSources && state.serverInstructionSources[server];
+      return typeof value === 'string' ? value : 'none';
     }
 
     function renderToolFilters() {
@@ -1026,6 +1249,102 @@ async fn root() -> Html<&'static str> {
       v.innerHTML = h;
     }
 
+    function renderEffectiveView() {
+      const payload = state.effectivePayload;
+      const summary = document.getElementById('effective-summary');
+      const view = document.getElementById('effective-view');
+      const raw = document.getElementById('effective-raw');
+      if (raw) {
+        raw.textContent = JSON.stringify(payload || {}, null, 2);
+      }
+      if (!payload) {
+        summary.innerHTML = '<span class="status-chip"><span class="dot dot-off"></span>building effective output</span>';
+        view.innerHTML = '<div class="v-empty">effective output not ready</div>';
+        return;
+      }
+
+      const helpServers = (payload.gambi_help && payload.gambi_help.servers) || [];
+      const localTools = (payload.mcp_tools_list && payload.mcp_tools_list.tools) || [];
+      const failures = payload.discovery_failures || [];
+      const impacts = payload.impacted_servers || [];
+      summary.innerHTML =
+        '<span class="status-chip"><span class="dot dot-ok"></span>initialize + tools/list preview</span>' +
+        '<span class="status-chip"><span class="dot dot-ok"></span>' + localTools.length + ' local tool(s)</span>' +
+        '<span class="status-chip"><span class="dot dot-ok"></span>' + helpServers.length + ' server(s) in gambi_help</span>' +
+        '<span class="status-chip"><span class="dot ' + (failures.length ? 'dot-err' : 'dot-ok') + '"></span>' + failures.length + ' discovery failure(s)</span>';
+
+      let html = '';
+      const instructions = payload.mcp_initialize && payload.mcp_initialize.instructions
+        ? payload.mcp_initialize.instructions
+        : 'No server instructions set';
+      html += '<article class="server-card">';
+      html += '<div class="server-head"><div class="server-title"><span class="dot dot-ok"></span><span class="server-name">initialize.instructions</span></div></div>';
+      html += '<pre class="effective-pre">' + esc(instructions) + '</pre>';
+      html += '</article>';
+
+      html += '<article class="server-card">';
+      html += '<div class="server-head"><div class="server-title"><span class="dot dot-ok"></span><span class="server-name">tools/list (local gambi tools)</span></div></div>';
+      if (!localTools.length) {
+        html += '<div class="v-empty">no local tools exposed</div>';
+      } else {
+        html += '<div class="tool-list">';
+        for (const tool of localTools) {
+          html += '<div class="tool-row"><div class="tool-name">' + esc(tool.name || '') + '</div><div class="tool-desc">' + esc(tool.description || '') + '</div></div>';
+        }
+        html += '</div>';
+      }
+      html += '</article>';
+
+      html += '<article class="server-card">';
+      html += '<div class="server-head"><div class="server-title"><span class="dot dot-warn"></span><span class="server-name">upstream impact</span></div></div>';
+      if (!impacts.length) {
+        html += '<div class="v-empty">no auth/discovery impact detected</div>';
+      } else {
+        html += '<div class="tool-list">';
+        for (const impact of impacts) {
+          const status = impact.discovery_error ? 'discovery error' : (impact.degraded ? 'degraded' : (impact.has_token ? 'healthy' : 'token missing'));
+          const dot = impact.discovery_error ? 'dot-err' : (impact.degraded ? 'dot-warn' : (impact.has_token ? 'dot-ok' : 'dot-off'));
+          html += '<div class="tool-row">';
+          html += '<div class="tool-top">';
+          html += '<div class="tool-name"><span class="dot ' + dot + '"></span> ' + esc(impact.server || '') + '</div>';
+          html += '<span class="pill pill-src">' + esc(status) + '</span>';
+          html += '</div>';
+          if (impact.discovery_error) {
+            html += '<div class="tool-desc">' + esc(impact.discovery_error) + '</div>';
+          } else if (impact.auth_error) {
+            html += '<div class="tool-desc">' + esc(impact.auth_error) + '</div>';
+          }
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+      html += '</article>';
+
+      html += '<article class="server-card">';
+      html += '<div class="server-head"><div class="server-title"><span class="dot dot-ok"></span><span class="server-name">gambi effective tool routing</span></div></div>';
+      const toolDetails = Array.isArray(payload.tool_details) ? payload.tool_details.filter(function(detail) { return Boolean(detail.server); }) : [];
+      if (!toolDetails.length) {
+        html += '<div class="v-empty">no upstream tools currently exposed</div>';
+      } else {
+        html += '<div class="tool-list">';
+        for (const detail of toolDetails) {
+          const levelClass = detail.policy_level === 'safe' ? 'pill-safe' : 'pill-esc';
+          const activeClass = detail.enabled ? 'pill-safe' : 'pill-esc';
+          html += '<div class="tool-row">';
+          html += '<div class="tool-top">';
+          html += '<div class="tool-name">' + esc(detail.name || '') + '</div>';
+          html += '<div class="tool-actions"><span class="pill ' + activeClass + '">' + (detail.enabled ? 'active' : 'inactive') + '</span><span class="pill ' + levelClass + '">' + esc(detail.policy_level || '') + '</span><span class="pill pill-src">' + esc(detail.activation_source || '') + ' · ' + esc(detail.policy_source || '') + '</span></div>';
+          html += '</div>';
+          html += '<div class="tool-desc">' + esc(detail.description || '') + '</div>';
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+      html += '</article>';
+
+      view.innerHTML = html;
+    }
+
     async function startOauth(server) {
       await runAction('start oauth', async function() {
         const response = await fetch('/auth/start', {
@@ -1066,15 +1385,35 @@ async fn root() -> Html<&'static str> {
           fetchJson('/auth/status', 'auth/status')
         ]);
         if (refreshToolsNow) {
-          state.toolsPayload = await fetchJson('/tools', 'tools');
+          const [toolsPayload, effectivePayload] = await Promise.all([
+            fetchJson('/tools', 'tools'),
+            fetchJson('/effective', 'effective')
+          ]);
+          state.toolsPayload = toolsPayload;
+          state.effectivePayload = effectivePayload;
           state.toolsRefreshAtMs = Date.now();
         }
         state.currentServers = serversPayload.servers || [];
         state.serverActivationModes = serversPayload.server_tool_activation_modes || {};
         state.toolActivationOverrides = serversPayload.tool_activation_overrides || {};
         state.serverPolicyModes = serversPayload.server_tool_policy_modes || {};
+        state.serverInstructionOverrides = serversPayload.server_instruction_overrides || {};
+        state.upstreamServerInstructions = serversPayload.upstream_server_instructions || {};
+        state.effectiveServerInstructions = serversPayload.effective_server_instructions || {};
+        state.serverInstructionSources = serversPayload.server_instruction_sources || {};
         state.descriptionOverrides = serversPayload.tool_description_overrides || {};
         state.authStatuses = authPayload.statuses || [];
+        state.latestStatusPayload = statusPayload;
+        if (state.editingServerInstructionServer) {
+          const stillPresent = state.currentServers.some(function(server) {
+            return server && server.name === state.editingServerInstructionServer;
+          });
+          if (!stillPresent) {
+            state.editingServerInstructionServer = null;
+            state.editingServerInstructionDraft = '';
+            state.showServerInstructionDiff = false;
+          }
+        }
         document.getElementById('status').textContent = JSON.stringify(statusPayload, null, 2);
         document.getElementById('tools-raw').textContent = JSON.stringify(state.toolsPayload || {}, null, 2);
         document.getElementById('servers-raw').textContent = JSON.stringify({
@@ -1082,6 +1421,10 @@ async fn root() -> Html<&'static str> {
           server_tool_activation_modes: state.serverActivationModes,
           tool_activation_overrides: state.toolActivationOverrides,
           server_tool_policy_modes: serversPayload.server_tool_policy_modes || {},
+          server_instruction_overrides: state.serverInstructionOverrides,
+          upstream_server_instructions: state.upstreamServerInstructions,
+          effective_server_instructions: state.effectiveServerInstructions,
+          server_instruction_sources: state.serverInstructionSources,
           tool_description_overrides: state.descriptionOverrides,
           tool_policy_overrides: serversPayload.tool_policy_overrides || {}
         }, null, 2);
@@ -1092,15 +1435,68 @@ async fn root() -> Html<&'static str> {
           renderLogsFromState();
         }
 
-        renderStatusBar(statusPayload);
-        renderStatusStrip();
-        renderServersView();
-        renderToolFilters();
-        if (state.editingToolKey && !forceTools && !refreshToolsNow) {
+        const freezeInteractiveRenders = !forceTools && (
+          hasNonCollapsedSelection() || isEditableElement(document.activeElement)
+        );
+        if (freezeInteractiveRenders) {
           captureEditingDraftFromDom();
+          state.statusBarDirty = true;
+          state.statusStripDirty = true;
+          state.serversDirty = true;
+          state.toolFiltersDirty = true;
+          state.toolsDirty = true;
+          state.effectiveDirty = true;
         } else {
-          renderToolsView();
+          renderStatusBar(statusPayload);
+          state.statusBarDirty = false;
+
+          const preserveStatusStrip = !forceTools && isInteractingWithin(document.getElementById('status-strip'));
+          if (preserveStatusStrip) {
+            state.statusStripDirty = true;
+          } else {
+            renderStatusStrip();
+            state.statusStripDirty = false;
+          }
+
+          const preserveServersView = !forceTools && (
+            Boolean(state.editingServerInstructionServer) || isInteractingWithin(document.getElementById('tab-servers'))
+          );
+          if (preserveServersView) {
+            captureEditingDraftFromDom();
+            state.serversDirty = true;
+          } else {
+            renderServersView();
+            state.serversDirty = false;
+          }
+
+          const preserveToolFilters = !forceTools && isInteractingWithin(document.querySelector('#tab-tools .tool-toolbar'));
+          if (preserveToolFilters) {
+            state.toolFiltersDirty = true;
+          } else {
+            renderToolFilters();
+            state.toolFiltersDirty = false;
+          }
+
+          const preserveToolsView = !forceTools && (
+            Boolean(state.editingToolKey) || isInteractingWithin(document.getElementById('tab-tools'))
+          );
+          if (preserveToolsView) {
+            captureEditingDraftFromDom();
+            state.toolsDirty = true;
+          } else {
+            renderToolsView();
+            state.toolsDirty = false;
+          }
+
+          const preserveEffectiveView = !forceTools && isInteractingWithin(document.getElementById('tab-effective'));
+          if (preserveEffectiveView) {
+            state.effectiveDirty = true;
+          } else {
+            renderEffectiveView();
+            state.effectiveDirty = false;
+          }
         }
+        flushDeferredRenders();
       } catch (error) {
         setError('refresh failed: ' + (error instanceof Error ? error.message : String(error)));
       } finally {
@@ -1192,6 +1588,60 @@ async fn root() -> Html<&'static str> {
         await runAction('remove server', async function() {
           await deletePath('/servers/' + encodeURIComponent(server));
           state.confirmRemoveServer = null;
+          if (state.editingServerInstructionServer === server) {
+            state.editingServerInstructionServer = null;
+            state.editingServerInstructionDraft = '';
+            state.showServerInstructionDiff = false;
+          }
+          await refresh({ forceTools: true });
+        });
+        return;
+      }
+      if (action === 'edit-server-instruction') {
+        state.editingServerInstructionServer = server;
+        state.editingServerInstructionDraft = effectiveServerInstruction(server);
+        state.showServerInstructionDiff = false;
+        renderServersView();
+        return;
+      }
+      if (action === 'cancel-server-instruction') {
+        state.editingServerInstructionServer = null;
+        state.editingServerInstructionDraft = '';
+        state.showServerInstructionDiff = false;
+        renderServersView();
+        return;
+      }
+      if (action === 'toggle-server-instruction-diff') {
+        state.showServerInstructionDiff = !state.showServerInstructionDiff;
+        renderServersView();
+        return;
+      }
+      if (action === 'save-server-instruction') {
+        const textarea = document.getElementById('edit-server-instruction-text');
+        const instruction = textarea ? textarea.value : state.editingServerInstructionDraft;
+        if (!instruction || !instruction.trim()) {
+          setError('save server instruction override failed: instruction cannot be empty');
+          return;
+        }
+        if (instruction.trim().length > SERVER_INSTRUCTION_MAX_LENGTH) {
+          setError('save server instruction override failed: instruction exceeds max length of ' + SERVER_INSTRUCTION_MAX_LENGTH + ' characters');
+          return;
+        }
+        await runAction('save server instruction override', async function() {
+          await postJson('/server-instructions', { server: server, instruction: instruction.trim() });
+          state.editingServerInstructionServer = null;
+          state.editingServerInstructionDraft = '';
+          state.showServerInstructionDiff = false;
+          await refresh({ forceTools: true });
+        });
+        return;
+      }
+      if (action === 'restore-server-instruction') {
+        await runAction('restore server instruction override', async function() {
+          await postJson('/server-instructions/remove', { server: server });
+          state.editingServerInstructionServer = null;
+          state.editingServerInstructionDraft = '';
+          state.showServerInstructionDiff = false;
           await refresh({ forceTools: true });
         });
         return;
@@ -1311,8 +1761,17 @@ async fn root() -> Html<&'static str> {
     document.body.addEventListener('input', function(event) {
       const target = event.target;
       if (!(target instanceof Element)) return;
-      if (target.id !== 'edit-desc-text') return;
-      state.editingDraft = target.value || '';
+      if (target.id === 'edit-desc-text') {
+        state.editingDraft = target.value || '';
+        return;
+      }
+      if (target.id === 'edit-server-instruction-text') {
+        state.editingServerInstructionDraft = target.value || '';
+        const saveButton = document.querySelector('[data-action="save-server-instruction"]');
+        if (saveButton) {
+          saveButton.disabled = !state.editingServerInstructionDraft.trim();
+        }
+      }
     });
 
     document.getElementById('tool-filter-server').addEventListener('change', function(event) {
@@ -1338,9 +1797,16 @@ async fn root() -> Html<&'static str> {
       setActiveTab(readHashTab());
     });
     document.addEventListener('selectionchange', function() {
-      if (!state.logsDirty) return;
-      if (isSelectingLogsText()) return;
-      renderLogsFromState();
+      flushDeferredRenders();
+    });
+    document.body.addEventListener('focusout', function() {
+      setTimeout(flushDeferredRenders, 0);
+    });
+    document.body.addEventListener('mouseup', function() {
+      flushDeferredRenders();
+    });
+    document.body.addEventListener('keyup', function() {
+      flushDeferredRenders();
     });
 
     void refresh({ forceTools: true });
@@ -1380,11 +1846,26 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, A
 
 async fn servers(State(state): State<AppState>) -> Result<Json<ServersResponse>, ApiError> {
     let cfg = load_config(&state).await?;
+    let upstream_server_instructions = state.upstream.connected_server_instructions().await;
+    let mut effective_server_instructions = BTreeMap::new();
+    let mut server_instruction_sources = BTreeMap::new();
+    for server in &cfg.servers {
+        let decision = cfg.resolve_server_instruction(&upstream_server_instructions, &server.name);
+        if let Some(instruction) = decision.instruction {
+            effective_server_instructions.insert(server.name.clone(), instruction);
+        }
+        server_instruction_sources
+            .insert(server.name.clone(), decision.source.as_str().to_string());
+    }
     Ok(Json(ServersResponse {
         servers: cfg.servers,
         server_tool_activation_modes: cfg.server_tool_activation_modes,
         tool_activation_overrides: cfg.tool_activation_overrides,
         server_tool_policy_modes: cfg.server_tool_policy_modes,
+        server_instruction_overrides: cfg.server_instruction_overrides,
+        upstream_server_instructions,
+        effective_server_instructions,
+        server_instruction_sources,
         tool_description_overrides: cfg.tool_description_overrides,
         tool_policy_overrides: cfg.tool_policy_overrides,
     }))
@@ -1416,7 +1897,7 @@ async fn add_server(
         .await
         .map_err(|err| {
             error!(error = %err, server = %server_name, "failed to add server");
-            ApiError::bad_request(format!("failed to add server: {err}"))
+            map_config_mutation_error("add server", err)
         })?;
     state.upstream.invalidate_discovery_cache().await;
 
@@ -1471,7 +1952,7 @@ async fn update_server_exposure(
                 server = %name,
                 "failed to update server exposure mode"
             );
-            ApiError::bad_request(format!("failed to update exposure mode: {err}"))
+            map_config_mutation_error("update exposure mode", err)
         })?;
     state.upstream.invalidate_discovery_cache().await;
     Ok(Json(MutationResponse { status: "ok" }))
@@ -1493,7 +1974,7 @@ async fn update_server_tool_policy(
                 server = %name,
                 "failed to update server tool policy mode"
             );
-            ApiError::bad_request(format!("failed to update policy mode: {err}"))
+            map_config_mutation_error("update policy mode", err)
         })?;
     state.upstream.invalidate_discovery_cache().await;
     Ok(Json(MutationResponse { status: "ok" }))
@@ -1517,7 +1998,7 @@ async fn update_server_tool_activation(
                 server = %name,
                 "failed to update server tool activation mode"
             );
-            ApiError::bad_request(format!("failed to update tool default: {err}"))
+            map_config_mutation_error("update tool default", err)
         })?;
     state.upstream.invalidate_discovery_cache().await;
     Ok(Json(MutationResponse { status: "ok" }))
@@ -1541,7 +2022,7 @@ async fn update_server_enabled(
                 enabled,
                 "failed to update server enabled state"
             );
-            ApiError::bad_request(format!("failed to update server enabled state: {err}"))
+            map_config_mutation_error("update server enabled state", err)
         })?;
     if !enabled {
         state.upstream.evict_server(&name).await;
@@ -1571,8 +2052,59 @@ async fn set_tool_activation_override(
                 enabled = request.enabled,
                 "failed to set tool activation override"
             );
-            ApiError::bad_request(format!("failed to set tool activation override: {err}"))
+            map_config_mutation_error("set tool activation override", err)
         })?;
+    state.upstream.invalidate_discovery_cache().await;
+
+    Ok(Json(MutationResponse { status: "ok" }))
+}
+
+async fn set_server_instruction_override(
+    State(state): State<AppState>,
+    Json(request): Json<ServerInstructionOverrideRequest>,
+) -> Result<Json<MutationResponse>, ApiError> {
+    let req_server = request.server.clone();
+    let req_instruction = request.instruction.clone();
+    state
+        .store
+        .update_async(move |cfg| cfg.set_server_instruction_override(&req_server, &req_instruction))
+        .await
+        .map_err(|err| {
+            error!(
+                error = %err,
+                server = %request.server,
+                "failed to set server instruction override"
+            );
+            map_config_mutation_error("set server instruction override", err)
+        })?;
+    state.upstream.invalidate_discovery_cache().await;
+
+    Ok(Json(MutationResponse { status: "ok" }))
+}
+
+async fn remove_server_instruction_override(
+    State(state): State<AppState>,
+    Json(request): Json<RemoveServerInstructionOverrideRequest>,
+) -> Result<Json<MutationResponse>, ApiError> {
+    let req_server = request.server.clone();
+    let removed = state
+        .store
+        .update_async(move |cfg| Ok(cfg.remove_server_instruction_override(&req_server)))
+        .await
+        .map_err(|err| {
+            error!(
+                error = %err,
+                server = %request.server,
+                "failed to remove server instruction override"
+            );
+            ApiError::internal("failed to remove server instruction override")
+        })?;
+
+    if !removed {
+        return Err(ApiError::bad_request(
+            "server instruction override not found",
+        ));
+    }
     state.upstream.invalidate_discovery_cache().await;
 
     Ok(Json(MutationResponse { status: "ok" }))
@@ -1598,7 +2130,7 @@ async fn set_tool_description_override(
                 tool = %request.tool,
                 "failed to set tool description override"
             );
-            ApiError::bad_request(format!("failed to set tool description override: {err}"))
+            map_config_mutation_error("set tool description override", err)
         })?;
     state.upstream.invalidate_discovery_cache().await;
 
@@ -1651,7 +2183,7 @@ async fn set_tool_policy_override(
                 tool = %request.tool,
                 "failed to set tool policy override"
             );
-            ApiError::bad_request(format!("failed to set tool policy override: {err}"))
+            map_config_mutation_error("set tool policy override", err)
         })?;
     state.upstream.invalidate_discovery_cache().await;
 
@@ -1688,11 +2220,53 @@ async fn remove_tool_policy_override(
 
 async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, ApiError> {
     let cfg = load_config(&state).await?;
-    let enabled_servers = cfg.enabled_servers();
     let auth_headers = load_upstream_auth_headers(&state).await?;
+    let snapshot = build_tools_snapshot(&state, &cfg, &auth_headers).await?;
+    Ok(Json(snapshot))
+}
+
+async fn effective(
+    State(state): State<AppState>,
+) -> Result<Json<EffectiveOutputResponse>, ApiError> {
+    let cfg = load_config(&state).await?;
+    let auth_headers = load_upstream_auth_headers(&state).await?;
+    let tools_snapshot = build_tools_snapshot(&state, &cfg, &auth_headers).await?;
+    let preview =
+        super::mcp::effective_mcp_preview(&state.store, &state.upstream, state.exec_enabled)
+            .await
+            .map_err(|err| {
+                error!(error = %err, "failed to build effective mcp output preview");
+                ApiError::internal("failed to build effective output preview")
+            })?;
+    let auth_statuses = state.auth.list_statuses().await.map_err(|err| {
+        error!(error = %err, "failed to load auth statuses for effective output");
+        ApiError::internal("failed to load auth statuses")
+    })?;
+    let impacted_servers =
+        derive_effective_server_impacts(&tools_snapshot.failures, &auth_statuses);
+
+    Ok(Json(EffectiveOutputResponse {
+        mcp_initialize: preview.initialize,
+        mcp_tools_list: preview.tools_list,
+        gambi_list_servers: preview.gambi_list_servers,
+        gambi_list_upstream_tools: preview.gambi_list_upstream_tools,
+        gambi_help: preview.gambi_help,
+        tool_details: tools_snapshot.tool_details,
+        discovery_failures: tools_snapshot.failures,
+        impacted_servers,
+        auth_statuses,
+    }))
+}
+
+async fn build_tools_snapshot(
+    state: &AppState,
+    cfg: &AppConfig,
+    auth_headers: &upstream::UpstreamAuthHeaders,
+) -> Result<ToolsResponse, ApiError> {
+    let enabled_servers = cfg.enabled_servers();
     let discovery = state
         .upstream
-        .discover_tools_from_servers(&enabled_servers, &auth_headers)
+        .discover_tools_from_servers(&enabled_servers, auth_headers)
         .await
         .map_err(|err| {
             error!(error = %err, "failed to discover upstream tools for tools request");
@@ -1932,11 +2506,49 @@ async fn tools(State(state): State<AppState>) -> Result<Json<ToolsResponse>, Api
     );
     let tool_details = tool_details.into_values().collect::<Vec<_>>();
 
-    Ok(Json(ToolsResponse {
+    Ok(ToolsResponse {
         tools,
         tool_details,
         failures,
-    }))
+    })
+}
+
+fn derive_effective_server_impacts(
+    failures: &[ToolDiscoveryFailure],
+    auth_statuses: &[AuthServerStatus],
+) -> Vec<EffectiveServerImpact> {
+    let mut failure_by_server = BTreeMap::<String, String>::new();
+    for failure in failures {
+        failure_by_server
+            .entry(failure.server.clone())
+            .or_insert_with(|| failure.error.clone());
+    }
+
+    let mut rows = auth_statuses
+        .iter()
+        .map(|status| EffectiveServerImpact {
+            server: status.server.clone(),
+            discovery_error: failure_by_server.remove(&status.server),
+            oauth_configured: status.oauth_configured,
+            has_token: status.has_token,
+            degraded: status.degraded,
+            auth_error: status.last_error.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    for (server, discovery_error) in failure_by_server {
+        rows.push(EffectiveServerImpact {
+            server,
+            discovery_error: Some(discovery_error),
+            oauth_configured: false,
+            has_token: false,
+            degraded: false,
+            auth_error: None,
+        });
+    }
+
+    rows.sort_by(|a, b| a.server.cmp(&b.server));
+    rows
 }
 
 fn looks_like_auth_required(message: &str) -> bool {

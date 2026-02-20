@@ -235,6 +235,7 @@ mod tests {
                 tool_activation_overrides: std::collections::BTreeMap::new(),
                 server_tool_policy_modes: std::collections::BTreeMap::new(),
                 tool_description_overrides: std::collections::BTreeMap::new(),
+                server_instruction_overrides: std::collections::BTreeMap::new(),
                 tool_policy_overrides: std::collections::BTreeMap::new(),
             })
             .expect("config should persist");

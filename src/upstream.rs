@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -372,6 +372,7 @@ struct ManagedUpstreamClient {
     server_name: String,
     server_url: String,
     auth_header: Option<String>,
+    instructions: Option<String>,
     peer: Peer<RoleClient>,
     progress_registry: Arc<ProgressRegistry>,
     running: Mutex<Option<RunningService<RoleClient, UpstreamClient>>>,
@@ -458,6 +459,37 @@ impl UpstreamManager {
             return 0;
         }
         entry.value.failures.len()
+    }
+
+    pub async fn connected_server_instructions(&self) -> BTreeMap<String, String> {
+        let snapshot = {
+            let guard = self.inner.clients.lock().await;
+            guard
+                .iter()
+                .filter_map(|(server_name, client)| {
+                    client
+                        .instructions
+                        .as_ref()
+                        .map(|instruction| (server_name.clone(), instruction.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        snapshot.into_iter().collect()
+    }
+
+    pub fn connected_server_instructions_snapshot(&self) -> BTreeMap<String, String> {
+        let Ok(guard) = self.inner.clients.try_lock() else {
+            return BTreeMap::new();
+        };
+        guard
+            .iter()
+            .filter_map(|(server_name, client)| {
+                client
+                    .instructions
+                    .as_ref()
+                    .map(|instruction| (server_name.clone(), instruction.clone()))
+            })
+            .collect()
     }
 
     pub async fn discover_tools_from_servers(
@@ -1335,11 +1367,18 @@ async fn spawn_managed_stdio_client(
         .with_context(|| format!("failed to initialize MCP client for '{}'", server.name))?;
 
     let peer = service.peer().clone();
+    let instructions = peer
+        .peer_info()
+        .and_then(|info| info.instructions.as_deref())
+        .map(str::trim)
+        .filter(|instruction| !instruction.is_empty())
+        .map(std::string::ToString::to_string);
 
     Ok(ManagedUpstreamClient {
         server_name: server.name.clone(),
         server_url: server.url.clone(),
         auth_header: None,
+        instructions,
         peer,
         progress_registry: handler.progress_registry(),
         running: Mutex::new(Some(service)),
@@ -1389,11 +1428,18 @@ async fn spawn_managed_http_client(
     };
 
     let peer = service.peer().clone();
+    let instructions = peer
+        .peer_info()
+        .and_then(|info| info.instructions.as_deref())
+        .map(str::trim)
+        .filter(|instruction| !instruction.is_empty())
+        .map(std::string::ToString::to_string);
 
     Ok(ManagedUpstreamClient {
         server_name: server.name.clone(),
         server_url: server.url.clone(),
         auth_header: transport_config.auth_header,
+        instructions,
         peer,
         progress_registry: handler.progress_registry(),
         running: Mutex::new(Some(service)),
@@ -1431,11 +1477,18 @@ async fn spawn_managed_sse_client(
         })?;
 
     let peer = service.peer().clone();
+    let instructions = peer
+        .peer_info()
+        .and_then(|info| info.instructions.as_deref())
+        .map(str::trim)
+        .filter(|instruction| !instruction.is_empty())
+        .map(std::string::ToString::to_string);
 
     Ok(ManagedUpstreamClient {
         server_name: server.name.clone(),
         server_url: server.url.clone(),
         auth_header: auth_header.map(std::string::ToString::to_string),
+        instructions,
         peer,
         progress_registry: handler.progress_registry(),
         running: Mutex::new(Some(service)),

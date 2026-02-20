@@ -17,6 +17,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const KEYCHAIN_ACCOUNT_NAME: &str = "oauth-tokens";
+pub const MAX_SERVER_INSTRUCTION_LENGTH: usize = 8_192;
 
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
@@ -295,6 +296,29 @@ pub struct ToolPolicyDecision {
     pub source: ToolPolicySource,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerInstructionSource {
+    Override,
+    Upstream,
+    None,
+}
+
+impl ServerInstructionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Override => "override",
+            Self::Upstream => "upstream",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerInstructionDecision {
+    pub instruction: Option<String>,
+    pub source: ServerInstructionSource,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerConfig {
     pub name: String,
@@ -337,6 +361,8 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_description_overrides: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_instruction_overrides: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_policy_overrides: BTreeMap<String, BTreeMap<String, ToolPolicyLevel>>,
 }
 
@@ -373,6 +399,7 @@ impl AppConfig {
             self.tool_activation_overrides.remove(server_name);
             self.server_tool_policy_modes.remove(server_name);
             self.tool_description_overrides.remove(server_name);
+            self.server_instruction_overrides.remove(server_name);
             self.tool_policy_overrides.remove(server_name);
         }
         removed
@@ -539,6 +566,65 @@ impl AppConfig {
             .or_default()
             .insert(tool_name.to_string(), description.to_string());
         Ok(())
+    }
+
+    pub fn set_server_instruction_override(
+        &mut self,
+        server_name: &str,
+        instruction: &str,
+    ) -> Result<()> {
+        if !self.servers.iter().any(|server| server.name == server_name) {
+            bail!("unknown server '{server_name}'");
+        }
+        let instruction = instruction.trim();
+        if instruction.is_empty() {
+            bail!("instruction cannot be empty");
+        }
+        if instruction.chars().count() > MAX_SERVER_INSTRUCTION_LENGTH {
+            bail!(
+                "instruction exceeds max length of {} characters",
+                MAX_SERVER_INSTRUCTION_LENGTH
+            );
+        }
+
+        self.server_instruction_overrides
+            .insert(server_name.to_string(), instruction.to_string());
+        Ok(())
+    }
+
+    pub fn remove_server_instruction_override(&mut self, server_name: &str) -> bool {
+        self.server_instruction_overrides
+            .remove(server_name)
+            .is_some()
+    }
+
+    pub fn server_instruction_override_for(&self, server_name: &str) -> Option<&str> {
+        self.server_instruction_overrides
+            .get(server_name)
+            .map(String::as_str)
+    }
+
+    pub fn resolve_server_instruction(
+        &self,
+        upstream_instructions: &BTreeMap<String, String>,
+        server_name: &str,
+    ) -> ServerInstructionDecision {
+        if let Some(override_instruction) = self.server_instruction_override_for(server_name) {
+            return ServerInstructionDecision {
+                instruction: Some(override_instruction.to_string()),
+                source: ServerInstructionSource::Override,
+            };
+        }
+        if let Some(upstream_instruction) = upstream_instructions.get(server_name) {
+            return ServerInstructionDecision {
+                instruction: Some(upstream_instruction.to_string()),
+                source: ServerInstructionSource::Upstream,
+            };
+        }
+        ServerInstructionDecision {
+            instruction: None,
+            source: ServerInstructionSource::None,
+        }
     }
 
     pub fn set_server_tool_policy_mode(
@@ -731,6 +817,21 @@ impl AppConfig {
                         "tool description override for '{server_name}:{upstream_tool_name}' cannot be empty"
                     );
                 }
+            }
+        }
+        for (server_name, instruction) in &self.server_instruction_overrides {
+            if !seen.contains(server_name) {
+                bail!("server instruction overrides reference unknown server '{server_name}'");
+            }
+            let trimmed = instruction.trim();
+            if trimmed.is_empty() {
+                bail!("server instruction override for '{server_name}' cannot be empty");
+            }
+            if trimmed.chars().count() > MAX_SERVER_INSTRUCTION_LENGTH {
+                bail!(
+                    "server instruction override for '{server_name}' exceeds max length of {} characters",
+                    MAX_SERVER_INSTRUCTION_LENGTH
+                );
             }
         }
         for (server_name, mode) in &self.server_tool_activation_modes {
@@ -1426,9 +1527,9 @@ fn enforce_owner_only_directory_permissions(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, ConfigStore, OAuthConfig, RuntimeProfile, ServerConfig, TokenStorage,
-        TokenStorePreference, ToolActivationMode, ToolPolicyLevel, ToolPolicyMode,
-        tool_matches_safe_heuristic,
+        AppConfig, ConfigStore, MAX_SERVER_INSTRUCTION_LENGTH, OAuthConfig, RuntimeProfile,
+        ServerConfig, ServerInstructionSource, TokenStorage, TokenStorePreference,
+        ToolActivationMode, ToolPolicyLevel, ToolPolicyMode, tool_matches_safe_heuristic,
     };
     use std::collections::BTreeMap;
     #[cfg(unix)]
@@ -1632,6 +1733,117 @@ mod tests {
     }
 
     #[test]
+    fn server_instruction_overrides_are_validated_and_pruned_on_server_removal() {
+        let mut cfg = AppConfig::default();
+        cfg.add_server(ServerConfig {
+            name: "port".to_string(),
+            url: "https://example.com/mcp".to_string(),
+            oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
+            enabled: true,
+        })
+        .expect("valid server should be added");
+
+        cfg.set_server_instruction_override("port", "Use this MCP for SDLC workflows")
+            .expect("valid override should be added");
+        assert_eq!(
+            cfg.server_instruction_override_for("port"),
+            Some("Use this MCP for SDLC workflows")
+        );
+
+        assert!(cfg.remove_server("port"));
+        assert!(
+            cfg.server_instruction_override_for("port").is_none(),
+            "removing a server should prune related instruction override"
+        );
+    }
+
+    #[test]
+    fn server_instruction_overrides_reject_unknown_or_empty_values() {
+        let mut cfg = AppConfig::default();
+        cfg.add_server(ServerConfig {
+            name: "github".to_string(),
+            url: "https://example.com/mcp".to_string(),
+            oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
+            enabled: true,
+        })
+        .expect("valid server should be added");
+
+        let unknown = cfg
+            .set_server_instruction_override("missing", "Use for code search")
+            .expect_err("override should reject unknown server");
+        assert!(unknown.to_string().contains("unknown server"));
+
+        let empty_instruction = cfg
+            .set_server_instruction_override("github", " ")
+            .expect_err("override should reject empty instruction");
+        assert!(
+            empty_instruction
+                .to_string()
+                .contains("instruction cannot be empty")
+        );
+
+        let too_long = "x".repeat(MAX_SERVER_INSTRUCTION_LENGTH + 1);
+        let too_long_err = cfg
+            .set_server_instruction_override("github", &too_long)
+            .expect_err("override should reject excessively long instruction");
+        assert!(
+            too_long_err
+                .to_string()
+                .contains("instruction exceeds max length"),
+            "unexpected error: {too_long_err}"
+        );
+    }
+
+    #[test]
+    fn resolve_server_instruction_prefers_override_then_upstream() {
+        let mut cfg = AppConfig::default();
+        cfg.add_server(ServerConfig {
+            name: "port".to_string(),
+            url: "https://example.com/mcp".to_string(),
+            oauth: None,
+            transport: Default::default(),
+            exposure_mode: Default::default(),
+            enabled: true,
+        })
+        .expect("valid server should be added");
+
+        let mut upstream = BTreeMap::new();
+        upstream.insert("port".to_string(), "Use upstream defaults".to_string());
+
+        let from_upstream = cfg.resolve_server_instruction(&upstream, "port");
+        assert_eq!(
+            from_upstream.source,
+            ServerInstructionSource::Upstream,
+            "upstream instruction should be used when no override exists"
+        );
+        assert_eq!(
+            from_upstream.instruction.as_deref(),
+            Some("Use upstream defaults")
+        );
+
+        cfg.set_server_instruction_override("port", "Use overridden workflow")
+            .expect("override should be accepted");
+        let from_override = cfg.resolve_server_instruction(&upstream, "port");
+        assert_eq!(
+            from_override.source,
+            ServerInstructionSource::Override,
+            "override must win over upstream instructions"
+        );
+        assert_eq!(
+            from_override.instruction.as_deref(),
+            Some("Use overridden workflow")
+        );
+
+        let missing = cfg.resolve_server_instruction(&upstream, "missing");
+        assert_eq!(missing.source, ServerInstructionSource::None);
+        assert!(missing.instruction.is_none());
+    }
+
+    #[test]
     fn tool_policy_heuristic_matches_name_and_description_prefixes() {
         assert!(tool_matches_safe_heuristic("getIssue", None));
         assert!(tool_matches_safe_heuristic("listIssues", None));
@@ -1827,6 +2039,7 @@ mod tests {
             tool_activation_overrides: BTreeMap::new(),
             server_tool_policy_modes: BTreeMap::new(),
             tool_description_overrides: BTreeMap::new(),
+            server_instruction_overrides: BTreeMap::new(),
             tool_policy_overrides: BTreeMap::new(),
         };
         let err = store
@@ -1908,6 +2121,7 @@ mod tests {
             tool_activation_overrides: BTreeMap::new(),
             server_tool_policy_modes: BTreeMap::new(),
             tool_description_overrides: BTreeMap::new(),
+            server_instruction_overrides: BTreeMap::new(),
             tool_policy_overrides: BTreeMap::new(),
         };
 
