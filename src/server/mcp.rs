@@ -170,7 +170,9 @@ impl McpServer {
              2. Check each server's instruction field for server-specific usage guidance.\n\
              3. Call gambi_execute first (safe policy enforcement).\n\
              4. If safe mode returns ESCALATION_REQUIRED, call gambi_execute_escalated.\n\
-             5. If discovery is sparse, call gambi_list_upstream_tools for diagnostics."
+             5. If discovery is sparse, call gambi_list_upstream_tools for diagnostics.\n\
+             \n\
+             Configured servers:"
         } else {
             "gambi execute-only mode with execution disabled (--no-exec):\n\
              Use gambi_help to inspect available upstream capabilities."
@@ -182,15 +184,12 @@ impl McpServer {
             Ok(cfg) => cfg,
             Err(err) => {
                 return Some(format!(
-                    "Configured servers (effective instruction preview):\n- unavailable: failed to load config ({err})"
+                    "- unavailable: failed to load config ({err})"
                 ));
             }
         };
         if cfg.servers.is_empty() {
-            return Some(
-                "Configured servers (effective instruction preview):\n- none configured"
-                    .to_string(),
-            );
+            return Some("- none configured".to_string());
         }
 
         let upstream_instructions = self.upstream.connected_server_instructions_snapshot();
@@ -202,27 +201,27 @@ impl McpServer {
             } else {
                 "disabled"
             };
-            let source = decision.source.as_str();
-            let instruction = decision
-                .instruction
-                .as_deref()
-                .map(summarize_instruction_for_initialize)
-                .unwrap_or_else(|| "none".to_string());
-            lines.push(format!(
-                "- {} ({enabled}, {source}): {instruction}",
-                server.name
-            ));
+            match decision.instruction.as_deref() {
+                Some(instruction) => {
+                    let source = decision.source.as_str();
+                    let summary = summarize_instruction_for_initialize(instruction);
+                    lines.push(format!(
+                        "- {} ({enabled}, {source}): {summary}",
+                        server.name
+                    ));
+                }
+                None => {
+                    lines.push(format!("- {} ({enabled})", server.name));
+                }
+            }
         }
-        Some(format!(
-            "Configured servers (effective instruction preview):\n{}",
-            lines.join("\n")
-        ))
+        Some(lines.join("\n"))
     }
 
     fn instructions_for_initialize(&self) -> String {
         let mut instructions = self.base_instructions().to_string();
         if let Some(digest) = self.initialize_server_instruction_digest() {
-            instructions.push_str("\n\n");
+            instructions.push('\n');
             instructions.push_str(&digest);
         }
         instructions
@@ -260,7 +259,7 @@ impl McpServer {
 
     #[tool(
         name = "gambi_execute",
-        description = "Safe execution path: run Python workflow in gambi (Monty runtime) with policy-aware upstream tool-call bridge. Use namespaced dot calls only, e.g. atlassian.searchJiraIssuesUsingJql(cloudId=\"...\", jql=\"...\"). Use read_file(\"/tmp/file.md\") for large UTF-8 payloads from disk. Escalated tools are blocked with ESCALATION_REQUIRED."
+        description = "Safe execution path: run a Python script that can call upstream tools. Escalated tools are blocked with ESCALATION_REQUIRED.\n\nCall tools with dot syntax: server.tool(keyword=\"value\"). All arguments must be keyword arguments.\n\nLanguage: subset of Python. Supports variables, functions (def), if/elif/else, for/while, list/dict comprehensions, f-strings, string methods, and arithmetic. No imports, no try/except, no classes, no with statements, no set literals, no standard library.\n\nRules:\n- Keyword arguments only: server.tool(param=\"value\"), never positional args\n- Return a value: the script's return value is the tool result (dict, list, string, number, bool, or None)\n- Upstream errors abort: if any tool call returns an error, execution stops immediately\n- read_file(\"/tmp/path\") loads UTF-8 text files (only /tmp is accessible)\n- Use print() for debug output (captured in stdout field)\n\nExample:\nresources = atlassian.getAccessibleAtlassianResources()\ncloud_id = resources[0][\"id\"]\nissues = atlassian.searchJiraIssuesUsingJql(cloudId=cloud_id, jql=\"project = PDDI ORDER BY updated DESC\", limit=5)\nreturn [{\"key\": i[\"key\"], \"summary\": i[\"summary\"]} for i in issues]"
     )]
     async fn gambi_execute(
         &self,
@@ -291,7 +290,7 @@ impl McpServer {
 
     #[tool(
         name = "gambi_execute_escalated",
-        description = "Escalated execution path: run Python workflow with full upstream tool access when safe mode returns ESCALATION_REQUIRED. Use namespaced dot calls only, e.g. server.tool(keyword=\"value\"). Use read_file(\"/tmp/file.md\") for large UTF-8 payloads from disk."
+        description = "Escalated execution path: run a Python script with full upstream tool access when safe mode returns ESCALATION_REQUIRED. Same language rules and syntax as gambi_execute."
     )]
     async fn gambi_execute_escalated(
         &self,
@@ -1264,14 +1263,40 @@ async fn gambi_help_output(
         })
         .collect::<Vec<_>>();
 
-    let usage = "Use gambi in execute-only mode:\n\
-1) Call gambi_help to inspect servers/tools.\n\
-2) Inspect each server's instruction field for usage guidance; if you need full tool metadata, call gambi_help with server/tool.\n\
-3) In gambi_execute, call upstream tools with namespaced Python dot syntax only: server.tool(keyword=value).\n\
-4) For large local content, use read_file(\"/tmp/...\") to load UTF-8 text into your workflow.\n\
-5) Do not use helper functions like call_tool(...) or tool(...); they are not available.\n\
-6) Run workflows through gambi_execute first (safe policy mode).\n\
-7) If response includes ESCALATION_REQUIRED, re-run with gambi_execute_escalated."
+    let usage = "Writing gambi_execute scripts:\n\
+\n\
+Call upstream tools with dot syntax: server.tool(keyword=value).\n\
+All arguments must be keyword arguments. Positional arguments are rejected.\n\
+\n\
+Language support (subset of Python):\n\
+  Supported: variables, def, if/elif/else, for/while, return, list/dict literals,\n\
+             comprehensions, f-strings, string methods (.split, .strip, .join, etc.),\n\
+             slicing, arithmetic, comparison, boolean operators, print().\n\
+  NOT supported: import, try/except, class, with, set literals, lambda, *args/**kwargs,\n\
+                 standard library, type hints, decorators, async/await.\n\
+\n\
+Behavior:\n\
+- The script's return value becomes the tool result. Always return something useful.\n\
+- If any upstream tool call returns an error, execution stops immediately.\n\
+- print() output is captured in the response's stdout field (useful for debugging).\n\
+- read_file(\"/tmp/path\") loads UTF-8 text from /tmp (only /tmp is accessible).\n\
+\n\
+Workflow:\n\
+1) Use gambi_help (with server/tool params) to get tool metadata before writing scripts.\n\
+2) Check the instruction field on each server for server-specific usage guidance.\n\
+3) Run scripts through gambi_execute first (safe policy).\n\
+4) If a tool requires escalation, the response says ESCALATION_REQUIRED — re-run via gambi_execute_escalated.\n\
+\n\
+Example — fetch Jira issues and summarize:\n\
+  resources = atlassian.getAccessibleAtlassianResources()\n\
+  cloud_id = resources[0][\"id\"]\n\
+  issues = atlassian.searchJiraIssuesUsingJql(cloudId=cloud_id, jql=\"status = Open\", limit=10)\n\
+  return [{\"key\": i[\"key\"], \"summary\": i[\"summary\"]} for i in issues]\n\
+\n\
+Example — cross-server workflow:\n\
+  ticket = linear.get_issue(id=\"PROJ-123\")\n\
+  atlassian.createJiraIssue(cloudId=\"abc\", projectKey=\"XY\", summary=ticket[\"title\"])\n\
+  return {\"synced\": ticket[\"id\"]}"
         .to_string();
 
     Ok(Json(HelpResponse {
@@ -1724,7 +1749,7 @@ mod tests {
             .map(|value| value.to_string())
             .unwrap_or_default();
 
-        assert!(instructions.contains("Configured servers (effective instruction preview):"));
+        assert!(instructions.contains("Configured servers:"));
         assert!(instructions.contains("- atlassian (enabled, override):"));
         assert!(instructions.contains("Use Jira and Confluence tools for engineering operations"));
     }
