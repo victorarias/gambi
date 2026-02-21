@@ -4,6 +4,10 @@ One MCP endpoint. All your servers. Code that calls them.
 
 A local MCP aggregator that gives your coding agent a single stdio connection to every upstream MCP server you use, plus a built-in execution tool that can call any of them from Python scripts — so the agent stops round-tripping one tool at a time.
 
+- **Automatic OAuth token refresh** — gambi handles PKCE, token refresh, rotation, and degraded-state recovery in the background. Agents never stall waiting for expired tokens.
+- **Python execution sandbox** — agents write short Python scripts that compose multiple tool calls in one shot, drastically reducing round-trips and token usage.
+- **Single MCP connection** — one stdio endpoint aggregates all your upstream servers with namespacing, exposure controls, and execution policy.
+
 ![gambi admin dashboard](docs/screenshots/admin-dashboard.png)
 
 ## Why this exists
@@ -21,7 +25,7 @@ That kind of duct-tape-and-ingenuity solution has a name in Brazilian Portuguese
 - **Single MCP connection** — your agent talks to one stdio server and gets a stable gambi surface (`gambi_help`, `gambi_execute`, etc.)
 - **Aggregation** — tools, prompts, and resources from every upstream server, with automatic namespacing and routing
 - **`gambi_execute` + `gambi_execute_escalated`** — safe-first execution with explicit escalation when workflows need higher-risk tools
-- **Admin UI** — web dashboard with three tabs (Servers, Tools, Logs) plus a status strip of per-server health chips; add/remove servers, activate/deactivate them, change exposure and policy via inline selectors, edit tool descriptions, and monitor logs
+- **Admin UI** — web dashboard with four tabs (Servers, Tools, Effective, Logs) plus a status strip of per-server health chips; add/remove servers, activate/deactivate them, change exposure and policy via inline selectors, edit tool descriptions, and monitor logs
 - **Activation controls** — deactivate a server without deleting config; reactivate with one click
 - **Tool activation controls** — per-server tool default (`all` or `none`) plus per-tool active/inactive toggles
 - **Exposure modes** — control how much tool metadata your agent sees: `passthrough`, `compact`, `names-only`, or `server-only`
@@ -147,7 +151,7 @@ slack.post_message(channel="eng", text=f"Issue loaded: {result['id']}")
 
 ## Admin UI
 
-The admin panel runs on loopback only (`http://127.0.0.1:3333`) and is organized into three tabs:
+The admin panel runs on loopback only (`http://127.0.0.1:3333`) and is organized into four tabs:
 
 **Header** — status badges (ok/error, exec on/off, server count, failure count) always visible at the top.
 
@@ -165,6 +169,8 @@ The admin panel runs on loopback only (`http://127.0.0.1:3333`) and is organized
 - `safe` / `escalated` routing badges you can click to override the policy for that tool
 - Source pill showing activation + policy source (`override`, `catalog-all`, `catalog-none`, `heuristic`, `system`)
 - Click-to-edit description: click the description text to open an inline editor with Save Override / Cancel buttons; when an override exists, a diff view and Restore button are available
+
+**Effective tab** — live preview of exactly what your agent sees: the `initialize` response (including instructions), local gambi tools, upstream tool routing (active/inactive, safe/escalated, source), and per-server health status. Use this to verify your configuration before your agent connects.
 
 **Logs tab** — tails recent server activity.
 
@@ -254,4 +260,4 @@ UI tests need: `npm ci && npm run test:ui:install`
 
 ## License
 
-See repository license terms.
+GPL-3.0. See [LICENSE](LICENSE).
