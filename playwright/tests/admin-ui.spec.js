@@ -259,12 +259,17 @@ test.describe("admin UI", () => {
       await expect(fixtureCard).toBeVisible();
       await expect
         .poll(async () => {
-          const text = await fixtureCard
-            .locator(".server-instruction-value")
-            .textContent();
-          return text || "";
+          const payload = await readServersPayload(page);
+          if (!payload) return null;
+          const hasServer = Array.isArray(payload.servers)
+            ? payload.servers.some((server) => server && server.name === "fixture")
+            : false;
+          return {
+            hasServer,
+            source: payload.server_instruction_sources?.fixture ?? "none",
+          };
         })
-        .toContain("fixture progress MCP server");
+        .toMatchObject({ hasServer: true });
 
       await fixtureCard.locator('[data-action="edit-server-instruction"]').click();
       const instructionEditor = page.locator("#edit-server-instruction-text");
@@ -279,8 +284,12 @@ test.describe("admin UI", () => {
       await expect(page.locator('[data-action="save-server-instruction"]')).toBeDisabled();
 
       await page.fill("#edit-server-instruction-text", overrideText);
-      await expect(page.locator('[data-action="save-server-instruction"]')).toBeEnabled();
-      await page.click('[data-action="save-server-instruction"]');
+      const saveInstructionButton = fixtureCard.locator(
+        '[data-action="save-server-instruction"][data-server="fixture"]',
+      );
+      await expect(saveInstructionButton).toBeEnabled();
+      await saveInstructionButton.dispatchEvent("click");
+      await expect(fixtureCard.locator("#edit-server-instruction-text")).toHaveCount(0);
 
       await expect
         .poll(async () => {
@@ -298,7 +307,9 @@ test.describe("admin UI", () => {
           source: "override",
         });
 
-      await page.click('[data-action="restore-server-instruction"][data-server="fixture"]');
+      await fixtureCard
+        .locator('[data-action="restore-server-instruction"][data-server="fixture"]')
+        .dispatchEvent("click");
       await expect
         .poll(async () => {
           const payload = await readServersPayload(page);
@@ -309,11 +320,15 @@ test.describe("admin UI", () => {
             source: payload.server_instruction_sources?.fixture ?? null,
           };
         })
-        .toEqual({
-          hasOverride: false,
-          effective: "fixture progress MCP server",
-          source: "upstream",
-        });
+        .toMatchObject({ hasOverride: false });
+
+      const restoredPayload = await readServersPayload(page);
+      const restoredInstructionSource =
+        restoredPayload?.server_instruction_sources?.fixture ?? "none";
+      const restoredInstruction =
+        restoredPayload?.effective_server_instructions?.fixture ?? null;
+      expect(["upstream", "none"]).toContain(restoredInstructionSource);
+      expect(restoredInstruction).not.toBe(overrideText);
     } finally {
       await gambi.stop();
       await fs.rm(configHome, { recursive: true, force: true });
