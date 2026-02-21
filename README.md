@@ -16,7 +16,9 @@ I tried to use an existing MCP hub. I couldn't get it to work. The documentation
 
 At the same time, I'd been thinking about a different problem. MCP is great — small scripts, API calls, structured tool access. But the more servers you add to a hub, the more tools your agent sees, and agents get lost in a sea of dozens of tools. Worse, they call them one by one, round-tripping for every little step of a workflow.
 
-So what if we solve both problems at once? A single aggregator that *just works* — one binary, zero config ceremony — **and** an execution tool that lets the agent write a short Python script to orchestrate multiple tool calls in one shot.
+There was also auth. OAuth-based MCP servers lose their tokens after a few minutes, and suddenly your agent is stalled, waiting for you to re-authenticate. I couldn't stand that either.
+
+So what if we solve all three problems at once? A single aggregator that *just works* — one binary, zero config ceremony — an execution tool that lets the agent write a short Python script to orchestrate multiple tool calls in one shot — **and** automatic token refresh that keeps every upstream server authenticated in the background.
 
 That kind of duct-tape-and-ingenuity solution has a name in Brazilian Portuguese: **gambiarra**. Hence, gambi.
 
