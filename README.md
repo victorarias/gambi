@@ -1,4 +1,4 @@
-# gambi
+![gambi](docs/banner.png)
 
 One MCP endpoint. All your servers. Code that calls them.
 
