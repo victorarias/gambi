@@ -259,7 +259,7 @@ impl McpServer {
 
     #[tool(
         name = "gambi_execute",
-        description = "Safe execution path: run a Python script that can call upstream tools. Escalated tools are blocked with ESCALATION_REQUIRED.\n\nCall tools with dot syntax: server.tool(keyword=\"value\"). All arguments must be keyword arguments.\n\nLanguage: subset of Python. Supports variables, functions (def), if/elif/else, for/while, list/dict comprehensions, f-strings, string methods, and arithmetic. No imports, no try/except, no classes, no with statements, no set literals, no standard library.\n\nRules:\n- Keyword arguments only: server.tool(param=\"value\"), never positional args\n- Return a value: the script's return value is the tool result (dict, list, string, number, bool, or None)\n- Upstream errors abort: if any tool call returns an error, execution stops immediately\n- read_file(\"/tmp/path\") loads UTF-8 text files (only /tmp is accessible)\n- Use print() for debug output (captured in stdout field)\n\nExample:\nresources = atlassian.getAccessibleAtlassianResources()\ncloud_id = resources[0][\"id\"]\nissues = atlassian.searchJiraIssuesUsingJql(cloudId=cloud_id, jql=\"project = PDDI ORDER BY updated DESC\", limit=5)\nreturn [{\"key\": i[\"key\"], \"summary\": i[\"summary\"]} for i in issues]"
+        description = "Safe execution path: run a Python script that can call upstream tools. Escalated tools are blocked with ESCALATION_REQUIRED.\n\nCall tools with dot syntax: server.tool(keyword=\"value\"). All arguments must be keyword arguments.\n\nLanguage: subset of Python. Supports variables, functions (def), if/elif/else, for/while, list/dict comprehensions, f-strings, string methods, and arithmetic. No imports, no try/except, no classes, no with statements, no set literals, no standard library.\n\nRules:\n- Keyword arguments only: server.tool(param=\"value\"), never positional args\n- Return a value: the script's return value is the tool result (dict, list, string, number, bool, or None)\n- Upstream errors abort: if any tool call returns an error, execution stops immediately\n- read_file(\"/tmp/path\") loads UTF-8 text files (only /tmp is accessible)\n- json_loads(string) parses a JSON string into a dict/list/value\n- json_dumps(value) serializes a dict/list/value to a JSON string\n- Use print() for debug output (captured in stdout field)\n\nExample:\nresources = atlassian.getAccessibleAtlassianResources()\ncloud_id = resources[0][\"id\"]\nissues = atlassian.searchJiraIssuesUsingJql(cloudId=cloud_id, jql=\"project = PDDI ORDER BY updated DESC\", limit=5)\nreturn [{\"key\": i[\"key\"], \"summary\": i[\"summary\"]} for i in issues]"
     )]
     async fn gambi_execute(
         &self,
@@ -1280,6 +1280,8 @@ Behavior:\n\
 - If any upstream tool call returns an error, execution stops immediately.\n\
 - print() output is captured in the response's stdout field (useful for debugging).\n\
 - read_file(\"/tmp/path\") loads UTF-8 text from /tmp (only /tmp is accessible).\n\
+- json_loads(string) parses a JSON string into a Python value (dict, list, etc.).\n\
+- json_dumps(value) serializes a Python value (dict, list, etc.) to a JSON string.\n\
 \n\
 Workflow:\n\
 1) Use gambi_help (with server/tool params) to get tool metadata before writing scripts.\n\

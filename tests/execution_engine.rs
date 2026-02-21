@@ -247,6 +247,139 @@ return {"ok": True}
     Ok(())
 }
 
+#[tokio::test]
+async fn gambi_execute_supports_json_loads_and_dumps() -> anyhow::Result<()> {
+    let (client, _temp) = spawn_gambi_with_fixture(BTreeMap::new()).await?;
+
+    // json_loads parses a JSON string into a dict
+    let response = execute(
+        &client,
+        r#"
+parsed = json_loads('{"a": 1, "b": [2, 3]}')
+return parsed
+"#,
+    )
+    .await?;
+    assert_eq!(response.result["a"], 1);
+    assert_eq!(response.result["b"], serde_json::json!([2, 3]));
+
+    // json_dumps serializes a dict to a JSON string
+    let response = execute(
+        &client,
+        r#"
+dumped = json_dumps({"key": [1, 2, 3]})
+return {"json_string": dumped}
+"#,
+    )
+    .await?;
+    let json_string = response.result["json_string"]
+        .as_str()
+        .expect("json_dumps should return a string");
+    let reparsed: serde_json::Value = serde_json::from_str(json_string)?;
+    assert_eq!(reparsed["key"], serde_json::json!([1, 2, 3]));
+
+    // round-trip: json_loads(json_dumps(value)) == value
+    let response = execute(
+        &client,
+        r#"
+original = {"x": 42, "y": "hello"}
+round_tripped = json_loads(json_dumps(original))
+return {"match": round_tripped == original, "value": round_tripped}
+"#,
+    )
+    .await?;
+    assert_eq!(response.result["match"], true);
+    assert_eq!(response.result["value"]["x"], 42);
+    assert_eq!(response.result["value"]["y"], "hello");
+
+    // json_loads with invalid JSON fails with a clear error
+    let err = execute(
+        &client,
+        r#"
+return json_loads("not json")
+"#,
+    )
+    .await
+    .expect_err("invalid JSON should fail");
+    let message = err.to_string().to_lowercase();
+    assert!(
+        message.contains("json_loads failed"),
+        "expected json_loads error, got: {err:#}"
+    );
+
+    // json_loads handles top-level arrays, booleans, nulls, numbers
+    let response = execute(
+        &client,
+        r#"
+arr = json_loads('[1, "two", null, true]')
+return {"arr": arr}
+"#,
+    )
+    .await?;
+    assert_eq!(
+        response.result["arr"],
+        serde_json::json!([1, "two", null, true])
+    );
+
+    let response = execute(&client, "return json_loads(\"true\")").await?;
+    assert_eq!(response.result, true);
+
+    let response = execute(&client, "return json_loads(\"null\")").await?;
+    assert_eq!(response.result, serde_json::Value::Null);
+
+    let response = execute(&client, "return json_loads(\"42\")").await?;
+    assert_eq!(response.result, 42);
+
+    // json_dumps handles None, booleans, lists, nested dicts
+    let response = execute(
+        &client,
+        r#"
+return {
+    "none": json_dumps(None),
+    "bool": json_dumps(True),
+    "list": json_dumps([1, "a", None]),
+    "nested": json_dumps({"a": {"b": [1, 2]}}),
+}
+"#,
+    )
+    .await?;
+    assert_eq!(response.result["none"].as_str().unwrap(), "null");
+    assert_eq!(response.result["bool"].as_str().unwrap(), "true");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(response.result["list"].as_str().unwrap())?,
+        serde_json::json!([1, "a", null])
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(response.result["nested"].as_str().unwrap())?,
+        serde_json::json!({"a": {"b": [1, 2]}})
+    );
+
+    // json_loads with unicode
+    let response = execute(
+        &client,
+        r#"
+return json_loads('{"emoji": "\u2764", "text": "caf\u00e9"}')
+"#,
+    )
+    .await?;
+    assert_eq!(response.result["emoji"], "\u{2764}");
+    assert_eq!(response.result["text"], "caf\u{e9}");
+
+    // json_dumps preserves unicode round-trip
+    let response = execute(
+        &client,
+        r#"
+original = json_loads('{"emoji": "\u2764"}')
+return json_loads(json_dumps(original))
+"#,
+    )
+    .await?;
+    assert_eq!(response.result["emoji"], "\u{2764}");
+
+    let _ = client.cancel().await;
+    Ok(())
+}
+
 async fn execute(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     code: &str,

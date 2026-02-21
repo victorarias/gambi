@@ -27,6 +27,8 @@ use crate::upstream::{
 
 const EXTERNAL_CALL_FN: &str = "__gambi_call__";
 const EXTERNAL_READ_FILE_FN: &str = "__gambi_read_file__";
+const EXTERNAL_JSON_LOADS_FN: &str = "__gambi_json_loads__";
+const EXTERNAL_JSON_DUMPS_FN: &str = "__gambi_json_dumps__";
 
 const DEFAULT_MAX_WALL_MS: u64 = 10_000;
 const DEFAULT_MAX_CPU_SECONDS: u64 = 10;
@@ -182,6 +184,8 @@ async fn run_monty_execution_loop(
         vec![
             EXTERNAL_CALL_FN.to_string(),
             EXTERNAL_READ_FILE_FN.to_string(),
+            EXTERNAL_JSON_LOADS_FN.to_string(),
+            EXTERNAL_JSON_DUMPS_FN.to_string(),
         ],
     )
     .map_err(map_monty_exception)?;
@@ -218,6 +222,19 @@ async fn run_monty_execution_loop(
                 } else if function_name == EXTERNAL_READ_FILE_FN {
                     let path = parse_read_file_call(args, kwargs)?;
                     Value::String(read_file_for_execution(&path, limits).await?)
+                } else if function_name == EXTERNAL_JSON_LOADS_FN {
+                    let input = parse_json_loads_call(args, kwargs)?;
+                    serde_json::from_str(&input).map_err(|err| {
+                        ExecutionError::Message(format!("json_loads failed: {err}"))
+                    })?
+                } else if function_name == EXTERNAL_JSON_DUMPS_FN {
+                    let object = parse_json_dumps_call(args, kwargs)?;
+                    let json_value =
+                        monty_object_to_json(&object).map_err(ExecutionError::Message)?;
+                    let serialized = serde_json::to_string(&json_value).map_err(|err| {
+                        ExecutionError::Message(format!("json_dumps failed: {err}"))
+                    })?;
+                    Value::String(serialized)
                 } else {
                     return Err(ExecutionError::Message(format!(
                         "unexpected external function call '{function_name}'"
@@ -313,6 +330,50 @@ fn parse_read_file_call(
     }
 
     Ok(path)
+}
+
+fn parse_json_loads_call(
+    args: Vec<MontyObject>,
+    kwargs: Vec<(MontyObject, MontyObject)>,
+) -> std::result::Result<String, ExecutionError> {
+    if !kwargs.is_empty() {
+        return Err(ExecutionError::Message(
+            "json_loads does not accept keyword arguments".to_string(),
+        ));
+    }
+    match args.as_slice() {
+        [MontyObject::String(s)] => Ok(s.clone()),
+        [single] => Err(ExecutionError::Message(format!(
+            "json_loads argument must be a string, got {}",
+            single.type_name()
+        ))),
+        [] => Err(ExecutionError::Message(
+            "json_loads requires a string argument".to_string(),
+        )),
+        _ => Err(ExecutionError::Message(
+            "json_loads accepts exactly one positional argument".to_string(),
+        )),
+    }
+}
+
+fn parse_json_dumps_call(
+    args: Vec<MontyObject>,
+    kwargs: Vec<(MontyObject, MontyObject)>,
+) -> std::result::Result<MontyObject, ExecutionError> {
+    if !kwargs.is_empty() {
+        return Err(ExecutionError::Message(
+            "json_dumps does not accept keyword arguments".to_string(),
+        ));
+    }
+    match args.len() {
+        1 => Ok(args.into_iter().next().expect("checked length")),
+        0 => Err(ExecutionError::Message(
+            "json_dumps requires one argument".to_string(),
+        )),
+        _ => Err(ExecutionError::Message(
+            "json_dumps accepts exactly one positional argument".to_string(),
+        )),
+    }
 }
 
 async fn read_file_for_execution(
@@ -726,6 +787,10 @@ fn build_monty_script(code: &str, servers: &[ServerConfig]) -> Result<String> {
     let mut script = String::new();
     script.push_str("def read_file(path):\n");
     script.push_str("    return __gambi_read_file__(path)\n\n");
+    script.push_str("def json_loads(s):\n");
+    script.push_str("    return __gambi_json_loads__(s)\n\n");
+    script.push_str("def json_dumps(v):\n");
+    script.push_str("    return __gambi_json_dumps__(v)\n\n");
     script.push_str("def __gambi_user_main__():\n");
 
     if rewritten.trim().is_empty() {
@@ -1126,8 +1191,9 @@ mod tests {
 
     use super::{
         ExecutionLimits, build_monty_script, looks_like_auth_failure_error,
-        looks_like_auth_failure_message, parse_external_tool_call, parse_read_file_call,
-        read_file_for_execution, rewrite_namespaced_tool_calls,
+        looks_like_auth_failure_message, parse_external_tool_call, parse_json_dumps_call,
+        parse_json_loads_call, parse_read_file_call, read_file_for_execution,
+        rewrite_namespaced_tool_calls,
     };
     use crate::config::ServerConfig;
     use crate::upstream::UpstreamRequestError;
@@ -1167,6 +1233,10 @@ mod tests {
 
         assert!(script.contains("def read_file(path):"));
         assert!(script.contains("return __gambi_read_file__(path)"));
+        assert!(script.contains("def json_loads(s):"));
+        assert!(script.contains("return __gambi_json_loads__(s)"));
+        assert!(script.contains("def json_dumps(v):"));
+        assert!(script.contains("return __gambi_json_dumps__(v)"));
         assert!(script.contains("def __gambi_user_main__():"));
         assert!(script.contains("__gambi_user_main__()"));
         assert!(script.contains("__gambi_call__(\"fixture:fixture_echo\", value=1)"));
@@ -1424,5 +1494,99 @@ return fixture.fixture_echo(value=3)
             !rewritten.contains("__gambi_call__(\"fixture:fixture_echo\""),
             "member access chains must not be rewritten as upstream tool calls"
         );
+    }
+
+    #[test]
+    fn parse_json_loads_call_accepts_string_arg() {
+        let result = parse_json_loads_call(
+            vec![MontyObject::String("{\"a\": 1}".to_string())],
+            vec![],
+        )
+        .expect("valid json_loads call should parse");
+        assert_eq!(result, "{\"a\": 1}");
+    }
+
+    #[test]
+    fn parse_json_loads_call_rejects_non_string() {
+        let err = parse_json_loads_call(vec![MontyObject::Int(42)], vec![])
+            .expect_err("non-string arg must fail");
+        assert!(err.to_string().contains("must be a string"));
+    }
+
+    #[test]
+    fn parse_json_loads_call_rejects_missing_arg() {
+        let err =
+            parse_json_loads_call(vec![], vec![]).expect_err("missing arg must fail");
+        assert!(err.to_string().contains("requires a string argument"));
+    }
+
+    #[test]
+    fn parse_json_loads_call_rejects_too_many_args() {
+        let err = parse_json_loads_call(
+            vec![
+                MontyObject::String("a".to_string()),
+                MontyObject::String("b".to_string()),
+            ],
+            vec![],
+        )
+        .expect_err("too many args must fail");
+        assert!(err.to_string().contains("exactly one"));
+    }
+
+    #[test]
+    fn parse_json_loads_call_rejects_kwargs() {
+        let err = parse_json_loads_call(
+            vec![],
+            vec![(
+                MontyObject::String("s".to_string()),
+                MontyObject::String("{}".to_string()),
+            )],
+        )
+        .expect_err("kwargs must fail");
+        assert!(err.to_string().contains("keyword arguments"));
+    }
+
+    #[test]
+    fn parse_json_dumps_call_accepts_any_type() {
+        let result = parse_json_dumps_call(vec![MontyObject::Int(42)], vec![])
+            .expect("valid json_dumps call should parse");
+        assert_eq!(result, MontyObject::Int(42));
+
+        let result = parse_json_dumps_call(
+            vec![MontyObject::String("hello".to_string())],
+            vec![],
+        )
+        .expect("string arg should parse");
+        assert_eq!(result, MontyObject::String("hello".to_string()));
+    }
+
+    #[test]
+    fn parse_json_dumps_call_rejects_missing_arg() {
+        let err =
+            parse_json_dumps_call(vec![], vec![]).expect_err("missing arg must fail");
+        assert!(err.to_string().contains("requires one argument"));
+    }
+
+    #[test]
+    fn parse_json_dumps_call_rejects_too_many_args() {
+        let err = parse_json_dumps_call(
+            vec![MontyObject::Int(1), MontyObject::Int(2)],
+            vec![],
+        )
+        .expect_err("too many args must fail");
+        assert!(err.to_string().contains("exactly one"));
+    }
+
+    #[test]
+    fn parse_json_dumps_call_rejects_kwargs() {
+        let err = parse_json_dumps_call(
+            vec![],
+            vec![(
+                MontyObject::String("v".to_string()),
+                MontyObject::Int(1),
+            )],
+        )
+        .expect_err("kwargs must fail");
+        assert!(err.to_string().contains("keyword arguments"));
     }
 }
