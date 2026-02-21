@@ -41,7 +41,29 @@ That kind of duct-tape-and-ingenuity solution has a name in Brazilian Portuguese
 
 ## Install
 
-Build from source:
+### Homebrew (macOS + Linux)
+
+```bash
+brew install victorarias/tap/gambi
+```
+
+### One-line installer (macOS + Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh
+```
+
+Optional flags:
+
+```bash
+# install a specific tag
+curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --version v0.1.0
+
+# install into a custom directory
+curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --bin-dir "$HOME/.local/bin"
+```
+
+### Build from source
 
 ```bash
 git clone git@github.com:victorarias/gambi.git
@@ -50,7 +72,7 @@ cargo build --release
 # binary: target/release/gambi
 ```
 
-Or install directly:
+Or install from source directly:
 
 ```bash
 cargo install --git https://github.com/victorarias/gambi.git
@@ -62,18 +84,36 @@ Prerequisites: Rust stable toolchain.
 
 ### 1. Point your coding agent to gambi
 
-Add this to your MCP client config (Claude Code, Cursor, etc.):
+#### Claude Code
+
+```bash
+claude mcp add -s user gambi gambi serve
+```
+
+#### Codex CLI
+
+```bash
+codex mcp add gambi -- gambi serve
+```
+
+#### Cursor
+
+Add this to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project-local):
 
 ```json
 {
-  "gambi": {
-    "command": "gambi",
-    "args": ["serve"]
+  "mcpServers": {
+    "gambi": {
+      "command": "gambi",
+      "args": ["serve"]
+    }
   }
 }
 ```
 
-That's it. gambi starts automatically when your agent connects.
+If the file already exists, merge only the `gambi` entry under `mcpServers`.
+
+After setup, gambi starts automatically when your agent connects.
 
 The admin UI will be at `http://127.0.0.1:3333` by default.
 
