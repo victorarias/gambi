@@ -260,7 +260,7 @@ impl McpServer {
 
     #[tool(
         name = "gambi_execute",
-        description = "Safe execution path: run Python workflow in gambi (Monty runtime) with policy-aware upstream tool-call bridge. Use namespaced dot calls only, e.g. atlassian.searchJiraIssuesUsingJql(cloudId=\"...\", jql=\"...\"). Escalated tools are blocked with ESCALATION_REQUIRED."
+        description = "Safe execution path: run Python workflow in gambi (Monty runtime) with policy-aware upstream tool-call bridge. Use namespaced dot calls only, e.g. atlassian.searchJiraIssuesUsingJql(cloudId=\"...\", jql=\"...\"). Use read_file(\"/tmp/file.md\") for large UTF-8 payloads from disk. Escalated tools are blocked with ESCALATION_REQUIRED."
     )]
     async fn gambi_execute(
         &self,
@@ -291,7 +291,7 @@ impl McpServer {
 
     #[tool(
         name = "gambi_execute_escalated",
-        description = "Escalated execution path: run Python workflow with full upstream tool access when safe mode returns ESCALATION_REQUIRED. Use namespaced dot calls only, e.g. server.tool(keyword=\"value\")."
+        description = "Escalated execution path: run Python workflow with full upstream tool access when safe mode returns ESCALATION_REQUIRED. Use namespaced dot calls only, e.g. server.tool(keyword=\"value\"). Use read_file(\"/tmp/file.md\") for large UTF-8 payloads from disk."
     )]
     async fn gambi_execute_escalated(
         &self,
@@ -1268,9 +1268,10 @@ async fn gambi_help_output(
 1) Call gambi_help to inspect servers/tools.\n\
 2) Inspect each server's instruction field for usage guidance; if you need full tool metadata, call gambi_help with server/tool.\n\
 3) In gambi_execute, call upstream tools with namespaced Python dot syntax only: server.tool(keyword=value).\n\
-4) Do not use helper functions like call_tool(...) or tool(...); they are not available.\n\
-5) Run workflows through gambi_execute first (safe policy mode).\n\
-6) If response includes ESCALATION_REQUIRED, re-run with gambi_execute_escalated."
+4) For large local content, use read_file(\"/tmp/...\") to load UTF-8 text into your workflow.\n\
+5) Do not use helper functions like call_tool(...) or tool(...); they are not available.\n\
+6) Run workflows through gambi_execute first (safe policy mode).\n\
+7) If response includes ESCALATION_REQUIRED, re-run with gambi_execute_escalated."
         .to_string();
 
     Ok(Json(HelpResponse {

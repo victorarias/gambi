@@ -138,6 +138,7 @@ slack.post_message(channel="eng", text=f"Issue loaded: {result['id']}")
 
 - Calls are namespaced: `server.tool(**kwargs)`
 - Keyword arguments only (positional args are rejected)
+- `read_file(path)` is built in for UTF-8 text file input from `/tmp` only (no imports required)
 - Upstream errors (`is_error=true`) fail the execution
 - Progress tokens are forwarded through nested calls
 - Runs on the [Monty](https://github.com/pydantic/monty) Python runtime with resource limits (not a sandbox)
@@ -193,7 +194,7 @@ Config directory: `~/.config/gambi/`
 
 | File | Purpose |
 |------|---------|
-| `config.json` | Servers, tool activation defaults/overrides, policy modes/overrides, and tool description overrides |
+| `config.json` | Servers, tool activation defaults/overrides, policy modes/overrides, tool description overrides, and server instruction overrides |
 | `tokens.json` | OAuth tokens (file-backed profiles) |
 
 Token storage profiles:
@@ -210,6 +211,7 @@ Token storage profiles:
 | `GAMBI_EXEC_MAX_CPU_SECS` | Max CPU seconds |
 | `GAMBI_EXEC_MAX_MEM_BYTES` | Max memory |
 | `GAMBI_EXEC_MAX_STDOUT_BYTES` | Max stdout capture |
+| `GAMBI_EXEC_MAX_READ_FILE_BYTES` | Max bytes returned by `read_file(path)` (reads restricted to `/tmp`) |
 
 **Upstream behavior:**
 

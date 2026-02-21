@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -25,12 +26,15 @@ use crate::upstream::{
 };
 
 const EXTERNAL_CALL_FN: &str = "__gambi_call__";
+const EXTERNAL_READ_FILE_FN: &str = "__gambi_read_file__";
 
 const DEFAULT_MAX_WALL_MS: u64 = 10_000;
 const DEFAULT_MAX_CPU_SECONDS: u64 = 10;
 const DEFAULT_MAX_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_ALLOCATION_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_MAX_STDOUT_BYTES: usize = 1_048_576;
+const DEFAULT_MAX_READ_FILE_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_READ_FILE_ROOT: &str = "/tmp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionPolicy {
@@ -45,6 +49,8 @@ pub struct ExecutionLimits {
     pub max_memory_bytes: u64,
     pub max_allocation_bytes: u64,
     pub max_stdout_bytes: usize,
+    pub max_read_file_bytes: usize,
+    pub read_file_allowed_roots: Option<Vec<PathBuf>>,
 }
 
 impl Default for ExecutionLimits {
@@ -61,6 +67,9 @@ impl Default for ExecutionLimits {
                 .unwrap_or(DEFAULT_MAX_ALLOCATION_BYTES),
             max_stdout_bytes: parse_usize_env("GAMBI_EXEC_MAX_STDOUT_BYTES")
                 .unwrap_or(DEFAULT_MAX_STDOUT_BYTES),
+            max_read_file_bytes: parse_usize_env("GAMBI_EXEC_MAX_READ_FILE_BYTES")
+                .unwrap_or(DEFAULT_MAX_READ_FILE_BYTES),
+            read_file_allowed_roots: Some(default_read_file_roots()),
         }
     }
 }
@@ -170,7 +179,10 @@ async fn run_monty_execution_loop(
         script.to_string(),
         "gambi_exec.py",
         vec![],
-        vec![EXTERNAL_CALL_FN.to_string()],
+        vec![
+            EXTERNAL_CALL_FN.to_string(),
+            EXTERNAL_READ_FILE_FN.to_string(),
+        ],
     )
     .map_err(map_monty_exception)?;
 
@@ -199,16 +211,18 @@ async fn run_monty_execution_loop(
                 state,
                 ..
             } => {
-                if function_name != EXTERNAL_CALL_FN {
+                let result_json = if function_name == EXTERNAL_CALL_FN {
+                    let tool_call = parse_external_tool_call(args, kwargs)?;
+                    tool_calls = tool_calls.saturating_add(1);
+                    handle_tool_call(tool_call.name, tool_call.arguments, runtime).await?
+                } else if function_name == EXTERNAL_READ_FILE_FN {
+                    let path = parse_read_file_call(args, kwargs)?;
+                    Value::String(read_file_for_execution(&path, limits).await?)
+                } else {
                     return Err(ExecutionError::Message(format!(
                         "unexpected external function call '{function_name}'"
                     )));
-                }
-
-                let tool_call = parse_external_tool_call(args, kwargs)?;
-                tool_calls = tool_calls.saturating_add(1);
-                let result_json =
-                    handle_tool_call(tool_call.name, tool_call.arguments, runtime).await?;
+                };
 
                 let monty_result =
                     json_to_monty_object(&result_json).map_err(ExecutionError::Message)?;
@@ -228,6 +242,158 @@ async fn run_monty_execution_loop(
             }
         }
     }
+}
+
+fn parse_read_file_call(
+    args: Vec<MontyObject>,
+    kwargs: Vec<(MontyObject, MontyObject)>,
+) -> std::result::Result<String, ExecutionError> {
+    let positional_path = match args.as_slice() {
+        [] => None,
+        [MontyObject::String(path)] => Some(path.clone()),
+        [single] => {
+            return Err(ExecutionError::Message(format!(
+                "read_file path must be a string, got {}",
+                single.type_name()
+            )));
+        }
+        _ => {
+            return Err(ExecutionError::Message(
+                "read_file accepts at most one positional argument".to_string(),
+            ));
+        }
+    };
+
+    let mut keyword_path: Option<String> = None;
+    for (key, value) in kwargs {
+        let key = match key {
+            MontyObject::String(value) => value,
+            other => {
+                return Err(ExecutionError::Message(format!(
+                    "read_file argument key must be string, got {}",
+                    other.type_name()
+                )));
+            }
+        };
+        if key != "path" {
+            return Err(ExecutionError::Message(format!(
+                "read_file received unknown keyword argument '{key}'"
+            )));
+        }
+        if keyword_path.is_some() {
+            return Err(ExecutionError::Message(
+                "read_file received duplicate 'path' argument".to_string(),
+            ));
+        }
+        let path = match value {
+            MontyObject::String(value) => value,
+            other => {
+                return Err(ExecutionError::Message(format!(
+                    "read_file path must be a string, got {}",
+                    other.type_name()
+                )));
+            }
+        };
+        keyword_path = Some(path);
+    }
+
+    if positional_path.is_some() && keyword_path.is_some() {
+        return Err(ExecutionError::Message(
+            "read_file path must be provided once (positional or keyword)".to_string(),
+        ));
+    }
+
+    let path = positional_path.or(keyword_path).ok_or_else(|| {
+        ExecutionError::Message("read_file requires a path string argument".to_string())
+    })?;
+    if path.trim().is_empty() {
+        return Err(ExecutionError::Message(
+            "read_file path cannot be empty".to_string(),
+        ));
+    }
+
+    Ok(path)
+}
+
+async fn read_file_for_execution(
+    requested_path: &str,
+    limits: &ExecutionLimits,
+) -> std::result::Result<String, ExecutionError> {
+    let requested = PathBuf::from(requested_path);
+    let resolved = tokio::fs::canonicalize(&requested).await.map_err(|err| {
+        ExecutionError::Message(format!("read_file failed for '{requested_path}': {err}"))
+    })?;
+
+    if let Some(roots) = limits.read_file_allowed_roots.as_ref() {
+        let normalized_roots = normalize_allowed_roots(roots).await;
+        let allowed = normalized_roots
+            .iter()
+            .any(|root| resolved.starts_with(root));
+        if !allowed {
+            let allowed_roots = normalized_roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ExecutionError::Message(format!(
+                "read_file denied for '{}': outside allowed roots ({allowed_roots})",
+                requested_path
+            )));
+        }
+    }
+
+    let metadata = tokio::fs::metadata(&resolved).await.map_err(|err| {
+        ExecutionError::Message(format!(
+            "read_file failed to inspect '{}': {err}",
+            resolved.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(ExecutionError::Message(format!(
+            "read_file path '{}' is not a file",
+            resolved.display()
+        )));
+    }
+    if metadata.len() > limits.max_read_file_bytes as u64 {
+        return Err(ExecutionError::Message(format!(
+            "read_file rejected '{}': file size {} bytes exceeds limit {} bytes",
+            resolved.display(),
+            metadata.len(),
+            limits.max_read_file_bytes
+        )));
+    }
+
+    let bytes = tokio::fs::read(&resolved).await.map_err(|err| {
+        ExecutionError::Message(format!(
+            "read_file failed for '{}': {err}",
+            resolved.display()
+        ))
+    })?;
+    if bytes.len() > limits.max_read_file_bytes {
+        return Err(ExecutionError::Message(format!(
+            "read_file rejected '{}': file size {} bytes exceeds limit {} bytes",
+            resolved.display(),
+            bytes.len(),
+            limits.max_read_file_bytes
+        )));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        ExecutionError::Message(format!(
+            "read_file supports UTF-8 text files only: '{}'",
+            resolved.display()
+        ))
+    })
+}
+
+async fn normalize_allowed_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut normalized = Vec::with_capacity(roots.len());
+    for root in roots {
+        let resolved = tokio::fs::canonicalize(root)
+            .await
+            .unwrap_or_else(|_| root.clone());
+        normalized.push(resolved);
+    }
+    normalized
 }
 
 #[derive(Debug)]
@@ -558,6 +724,8 @@ fn build_monty_limits(limits: &ExecutionLimits) -> ResourceLimits {
 fn build_monty_script(code: &str, servers: &[ServerConfig]) -> Result<String> {
     let rewritten = rewrite_namespaced_tool_calls(code, servers)?;
     let mut script = String::new();
+    script.push_str("def read_file(path):\n");
+    script.push_str("    return __gambi_read_file__(path)\n\n");
     script.push_str("def __gambi_user_main__():\n");
 
     if rewritten.trim().is_empty() {
@@ -892,6 +1060,11 @@ fn parse_usize_env(key: &str) -> Option<usize> {
     std::env::var(key).ok()?.parse::<usize>().ok()
 }
 
+fn default_read_file_roots() -> Vec<PathBuf> {
+    let root = PathBuf::from(DEFAULT_READ_FILE_ROOT);
+    vec![std::fs::canonicalize(&root).unwrap_or(root)]
+}
+
 #[derive(Debug)]
 struct BoundedPrint {
     output: CollectStringPrint,
@@ -952,8 +1125,9 @@ mod tests {
     use monty::MontyObject;
 
     use super::{
-        build_monty_script, looks_like_auth_failure_error, looks_like_auth_failure_message,
-        parse_external_tool_call, rewrite_namespaced_tool_calls,
+        ExecutionLimits, build_monty_script, looks_like_auth_failure_error,
+        looks_like_auth_failure_message, parse_external_tool_call, parse_read_file_call,
+        read_file_for_execution, rewrite_namespaced_tool_calls,
     };
     use crate::config::ServerConfig;
     use crate::upstream::UpstreamRequestError;
@@ -991,6 +1165,8 @@ mod tests {
         )
         .expect("script build should succeed");
 
+        assert!(script.contains("def read_file(path):"));
+        assert!(script.contains("return __gambi_read_file__(path)"));
         assert!(script.contains("def __gambi_user_main__():"));
         assert!(script.contains("__gambi_user_main__()"));
         assert!(script.contains("__gambi_call__(\"fixture:fixture_echo\", value=1)"));
@@ -1005,6 +1181,100 @@ mod tests {
         .expect("parse should succeed");
 
         assert!(parsed.arguments.is_empty());
+    }
+
+    #[test]
+    fn parse_read_file_call_accepts_positional_or_keyword_path() {
+        let positional =
+            parse_read_file_call(vec![MontyObject::String("/tmp/doc.md".to_string())], vec![])
+                .expect("positional path should parse");
+        assert_eq!(positional, "/tmp/doc.md");
+
+        let keyword = parse_read_file_call(
+            vec![],
+            vec![(
+                MontyObject::String("path".to_string()),
+                MontyObject::String("/tmp/doc.md".to_string()),
+            )],
+        )
+        .expect("keyword path should parse");
+        assert_eq!(keyword, "/tmp/doc.md");
+    }
+
+    #[test]
+    fn parse_read_file_call_rejects_invalid_shapes() {
+        let missing = parse_read_file_call(vec![], vec![]).expect_err("missing path must fail");
+        assert!(missing.to_string().contains("requires a path"));
+
+        let non_string = parse_read_file_call(vec![MontyObject::Int(1)], vec![])
+            .expect_err("non-string path must fail");
+        assert!(non_string.to_string().contains("must be a string"));
+
+        let duplicate = parse_read_file_call(
+            vec![MontyObject::String("/tmp/a".to_string())],
+            vec![(
+                MontyObject::String("path".to_string()),
+                MontyObject::String("/tmp/b".to_string()),
+            )],
+        )
+        .expect_err("duplicate path must fail");
+        assert!(duplicate.to_string().contains("provided once"));
+    }
+
+    #[test]
+    fn default_limits_restrict_read_file_to_tmp_root() {
+        let limits = ExecutionLimits::default();
+        let roots = limits
+            .read_file_allowed_roots
+            .as_ref()
+            .expect("default read_file roots should be configured");
+        assert_eq!(roots.len(), 1);
+        let expected =
+            std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        assert_eq!(roots[0], expected);
+    }
+
+    #[tokio::test]
+    async fn read_file_for_execution_reads_utf8_when_allowed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("payload.md");
+        std::fs::write(&target, "hello gambi").expect("write payload");
+
+        let limits = ExecutionLimits {
+            max_read_file_bytes: 1024,
+            read_file_allowed_roots: Some(vec![temp.path().to_path_buf()]),
+            ..ExecutionLimits::default()
+        };
+        let value = read_file_for_execution(target.to_str().expect("utf8 path"), &limits)
+            .await
+            .expect("file should be readable");
+        assert_eq!(value, "hello gambi");
+    }
+
+    #[tokio::test]
+    async fn read_file_for_execution_enforces_roots_and_size_limit() {
+        let allowed = tempfile::tempdir().expect("allowed tempdir");
+        let denied = tempfile::tempdir().expect("denied tempdir");
+        let denied_file = denied.path().join("payload.md");
+        std::fs::write(&denied_file, "outside root").expect("write denied payload");
+
+        let limits = ExecutionLimits {
+            max_read_file_bytes: 8,
+            read_file_allowed_roots: Some(vec![allowed.path().to_path_buf()]),
+            ..ExecutionLimits::default()
+        };
+        let denied_err = read_file_for_execution(denied_file.to_str().expect("utf8 path"), &limits)
+            .await
+            .expect_err("outside root must fail");
+        assert!(denied_err.to_string().contains("outside allowed roots"));
+
+        let allowed_big_file = allowed.path().join("big.md");
+        std::fs::write(&allowed_big_file, "1234567890").expect("write large payload");
+        let too_large =
+            read_file_for_execution(allowed_big_file.to_str().expect("utf8 path"), &limits)
+                .await
+                .expect_err("file over limit must fail");
+        assert!(too_large.to_string().contains("exceeds limit"));
     }
 
     #[test]
