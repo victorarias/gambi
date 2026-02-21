@@ -1498,11 +1498,9 @@ return fixture.fixture_echo(value=3)
 
     #[test]
     fn parse_json_loads_call_accepts_string_arg() {
-        let result = parse_json_loads_call(
-            vec![MontyObject::String("{\"a\": 1}".to_string())],
-            vec![],
-        )
-        .expect("valid json_loads call should parse");
+        let result =
+            parse_json_loads_call(vec![MontyObject::String("{\"a\": 1}".to_string())], vec![])
+                .expect("valid json_loads call should parse");
         assert_eq!(result, "{\"a\": 1}");
     }
 
@@ -1515,8 +1513,7 @@ return fixture.fixture_echo(value=3)
 
     #[test]
     fn parse_json_loads_call_rejects_missing_arg() {
-        let err =
-            parse_json_loads_call(vec![], vec![]).expect_err("missing arg must fail");
+        let err = parse_json_loads_call(vec![], vec![]).expect_err("missing arg must fail");
         assert!(err.to_string().contains("requires a string argument"));
     }
 
@@ -1552,28 +1549,21 @@ return fixture.fixture_echo(value=3)
             .expect("valid json_dumps call should parse");
         assert_eq!(result, MontyObject::Int(42));
 
-        let result = parse_json_dumps_call(
-            vec![MontyObject::String("hello".to_string())],
-            vec![],
-        )
-        .expect("string arg should parse");
+        let result = parse_json_dumps_call(vec![MontyObject::String("hello".to_string())], vec![])
+            .expect("string arg should parse");
         assert_eq!(result, MontyObject::String("hello".to_string()));
     }
 
     #[test]
     fn parse_json_dumps_call_rejects_missing_arg() {
-        let err =
-            parse_json_dumps_call(vec![], vec![]).expect_err("missing arg must fail");
+        let err = parse_json_dumps_call(vec![], vec![]).expect_err("missing arg must fail");
         assert!(err.to_string().contains("requires one argument"));
     }
 
     #[test]
     fn parse_json_dumps_call_rejects_too_many_args() {
-        let err = parse_json_dumps_call(
-            vec![MontyObject::Int(1), MontyObject::Int(2)],
-            vec![],
-        )
-        .expect_err("too many args must fail");
+        let err = parse_json_dumps_call(vec![MontyObject::Int(1), MontyObject::Int(2)], vec![])
+            .expect_err("too many args must fail");
         assert!(err.to_string().contains("exactly one"));
     }
 
@@ -1581,10 +1571,7 @@ return fixture.fixture_echo(value=3)
     fn parse_json_dumps_call_rejects_kwargs() {
         let err = parse_json_dumps_call(
             vec![],
-            vec![(
-                MontyObject::String("v".to_string()),
-                MontyObject::Int(1),
-            )],
+            vec![(MontyObject::String("v".to_string()), MontyObject::Int(1))],
         )
         .expect_err("kwargs must fail");
         assert!(err.to_string().contains("keyword arguments"));

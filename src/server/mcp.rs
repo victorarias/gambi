@@ -183,9 +183,7 @@ impl McpServer {
         let cfg = match self.store.load() {
             Ok(cfg) => cfg,
             Err(err) => {
-                return Some(format!(
-                    "- unavailable: failed to load config ({err})"
-                ));
+                return Some(format!("- unavailable: failed to load config ({err})"));
             }
         };
         if cfg.servers.is_empty() {
