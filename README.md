@@ -57,7 +57,7 @@ Optional flags:
 
 ```bash
 # install a specific tag
-curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --version v0.1.1
 
 # install into a custom directory
 curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --bin-dir "$HOME/.local/bin"
@@ -122,7 +122,8 @@ The admin UI will be at `http://127.0.0.1:3333` by default.
 Via CLI:
 
 ```bash
-gambi add github https://github.com/github/github-mcp-server
+gambi add playwright npx @playwright/mcp@latest
+gambi add playwright npx @playwright/mcp@latest -- --headless
 gambi add my-tool 'stdio:///usr/local/bin/my-mcp?arg=--stdio'
 gambi disable github
 gambi enable github
@@ -227,6 +228,7 @@ gambi serve                        # start (default: admin on :3333, exec enable
 gambi serve --admin-port 4000      # custom admin port
 gambi serve --no-exec              # disable both execution tools
 gambi add <name> <url>             # add upstream server
+gambi add <name> <command> [args]  # shorthand for stdio:// command targets
 gambi add <name> <url> --policy all-escalated
 gambi add <name> <url> --tool-default none
 gambi disable <name>               # deactivate server (keep config and auth state)

@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
+use url::form_urlencoded;
 
 use crate::auth::{TokenState, prune_token_state_for_server_names};
 use crate::config::{
@@ -60,7 +61,11 @@ pub struct ServeArgs {
 #[derive(Debug, Args)]
 struct AddArgs {
     name: String,
-    url: String,
+    /// MCP server endpoint URL (http/https/stdio://...) or a stdio command.
+    target: String,
+    /// Extra command arguments when target is a stdio command.
+    #[arg(value_name = "COMMAND_ARG", allow_hyphen_values = true)]
+    command_args: Vec<String>,
     /// Transport mode: auto (detect from URL), sse, or streamable-http.
     #[arg(long, default_value = "auto")]
     transport: String,
@@ -205,6 +210,36 @@ mod tests {
         assert!(debug.contains("tool_default: \"none\""));
     }
 
+    #[test]
+    fn parses_add_with_stdio_command_args() {
+        let cli = Cli::parse_from([
+            "gambi",
+            "add",
+            "playwright",
+            "npx",
+            "@playwright/mcp@latest",
+        ]);
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("target: \"npx\""));
+        assert!(debug.contains("\"@playwright/mcp@latest\""));
+    }
+
+    #[test]
+    fn parses_add_with_stdio_command_hyphen_args() {
+        let cli = Cli::parse_from([
+            "gambi",
+            "add",
+            "playwright",
+            "npx",
+            "--",
+            "@playwright/mcp@latest",
+            "--headless",
+        ]);
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("\"@playwright/mcp@latest\""));
+        assert!(debug.contains("\"--headless\""));
+    }
+
     #[tokio::test]
     async fn rejects_non_loopback_admin_host() {
         let cli = Cli::parse_from(["gambi", "serve", "--admin-host", "0.0.0.0"]);
@@ -318,11 +353,12 @@ pub async fn run(cli: Cli, store: ConfigStore) -> Result<()> {
             let exposure_mode = parse_exposure_flag(&args.exposure)?;
             let policy_mode = parse_policy_flag(&args.policy)?;
             let tool_activation_mode = parse_tool_default_flag(&args.tool_default)?;
+            let target_url = resolve_add_target(&args.target, &args.command_args)?;
             let server_name = args.name.clone();
             store.update(|cfg| {
                 cfg.add_server(ServerConfig {
                     name: args.name,
-                    url: args.url,
+                    url: target_url,
                     oauth: None,
                     transport,
                     exposure_mode,
@@ -601,5 +637,81 @@ fn parse_tool_default_flag(raw: &str) -> Result<ToolActivationMode> {
         "all" => Ok(ToolActivationMode::All),
         "none" => Ok(ToolActivationMode::None),
         other => bail!("invalid tool default '{other}', expected all|none"),
+    }
+}
+
+fn resolve_add_target(target: &str, command_args: &[String]) -> Result<String> {
+    let normalized = target.trim();
+    if normalized.is_empty() {
+        bail!("server target cannot be empty");
+    }
+
+    if looks_like_server_url(normalized) {
+        if !command_args.is_empty() {
+            bail!(
+                "extra command arguments are only valid with stdio command targets; \
+                 use either a URL (`http://`, `https://`, `stdio://`) or `gambi add <name> <command> [args...]`"
+            );
+        }
+        return Ok(normalized.to_string());
+    }
+
+    if normalized.contains('?') || normalized.contains('#') {
+        bail!(
+            "stdio command target cannot contain '?' or '#'; provide command and args separately"
+        );
+    }
+
+    let mut encoded = format!("stdio://{normalized}");
+    if !command_args.is_empty() {
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        for arg in command_args {
+            query.append_pair("arg", arg);
+        }
+        encoded.push('?');
+        encoded.push_str(&query.finish());
+    }
+    Ok(encoded)
+}
+
+fn looks_like_server_url(value: &str) -> bool {
+    value.starts_with("stdio://") || value.starts_with("http://") || value.starts_with("https://")
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::resolve_add_target;
+
+    #[test]
+    fn resolves_http_target_as_is() {
+        let resolved = resolve_add_target("https://example.com/mcp", &[])
+            .expect("http targets should pass through");
+        assert_eq!(resolved, "https://example.com/mcp");
+    }
+
+    #[test]
+    fn resolves_stdio_command_to_stdio_url() {
+        let resolved = resolve_add_target(
+            "npx",
+            &[
+                "@playwright/mcp@latest".to_string(),
+                "--headless".to_string(),
+            ],
+        )
+        .expect("command targets should convert to stdio url");
+        assert_eq!(
+            resolved,
+            "stdio://npx?arg=%40playwright%2Fmcp%40latest&arg=--headless"
+        );
+    }
+
+    #[test]
+    fn rejects_command_args_with_http_url() {
+        let err = resolve_add_target("https://example.com/mcp", &["--bad".to_string()])
+            .expect_err("http target with command args should fail");
+        assert!(
+            err.to_string()
+                .contains("extra command arguments are only valid")
+        );
     }
 }

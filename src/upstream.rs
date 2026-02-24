@@ -1570,7 +1570,12 @@ pub fn parse_stdio_target(url: &str) -> Result<StdioServerTarget> {
         if host.is_empty() {
             bail!("stdio url must include a command host or path");
         }
-        host.to_string()
+        let path_suffix = parsed.path().trim_start_matches('/');
+        if path_suffix.is_empty() {
+            host.to_string()
+        } else {
+            format!("{host}/{path_suffix}")
+        }
     } else {
         let path_command = parsed.path();
         if path_command.is_empty() || path_command == "/" {
@@ -1713,6 +1718,14 @@ mod tests {
         let parsed = parse_stdio_target("stdio:///usr/local/bin/mcp-server?arg=--stdio")
             .expect("parse should succeed");
         assert_eq!(parsed.command, "/usr/local/bin/mcp-server");
+        assert_eq!(parsed.args, vec!["--stdio"]);
+    }
+
+    #[test]
+    fn parses_stdio_host_with_path_command() {
+        let parsed = parse_stdio_target("stdio://node_modules/.bin/mcp-server?arg=--stdio")
+            .expect("parse should succeed");
+        assert_eq!(parsed.command, "node_modules/.bin/mcp-server");
         assert_eq!(parsed.args, vec!["--stdio"]);
     }
 
