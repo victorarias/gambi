@@ -37,11 +37,17 @@ const DEFAULT_MAX_ALLOCATION_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_MAX_STDOUT_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_READ_FILE_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_READ_FILE_ROOT: &str = "/tmp";
+const MAX_UPSTREAM_TOOL_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionPolicy {
     Safe,
     Escalated,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecuteOptions {
+    pub upstream_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +115,7 @@ pub async fn run_code_execution(
     upstream: &UpstreamManager,
     context: RequestContext<RoleServer>,
     policy: ExecutionPolicy,
+    options: ExecuteOptions,
 ) -> Result<ExecuteOutput, McpError> {
     let cfg = store.load_async().await.map_err(|err| {
         McpError::internal_error(format!("failed to load config for execution: {err}"), None)
@@ -134,6 +141,8 @@ pub async fn run_code_execution(
     let limits = ExecutionLimits::default();
     let started = Instant::now();
     let tool_descriptions = build_tool_description_index(&cfg, upstream, &auth_headers).await;
+    let tool_call_timeout = normalize_upstream_tool_timeout(options.upstream_timeout_ms)
+        .map_err(|err| McpError::invalid_params(err, None))?;
     let runtime_context = RuntimeContext {
         store,
         cfg: &cfg,
@@ -141,6 +150,7 @@ pub async fn run_code_execution(
         auth_headers: &auth_headers,
         tool_descriptions: &tool_descriptions,
         policy,
+        tool_call_timeout,
         upstream,
         request_context: &context,
     };
@@ -168,8 +178,23 @@ struct RuntimeContext<'a> {
     auth_headers: &'a UpstreamAuthHeaders,
     tool_descriptions: &'a HashMap<(String, String), String>,
     policy: ExecutionPolicy,
+    tool_call_timeout: Option<Duration>,
     upstream: &'a UpstreamManager,
     request_context: &'a RequestContext<RoleServer>,
+}
+
+fn normalize_upstream_tool_timeout(
+    requested_ms: Option<u64>,
+) -> std::result::Result<Option<Duration>, String> {
+    let Some(requested_ms) = requested_ms else {
+        return Ok(None);
+    };
+    if requested_ms == 0 {
+        return Err("upstream_timeout_ms must be greater than 0".to_string());
+    }
+    Ok(Some(Duration::from_millis(
+        requested_ms.min(MAX_UPSTREAM_TOOL_TIMEOUT_MS),
+    )))
 }
 
 async fn run_monty_execution_loop(
@@ -578,6 +603,7 @@ async fn handle_tool_call(
             server,
             runtime.auth_headers,
             request.clone(),
+            runtime.tool_call_timeout,
             runtime.request_context.ct.clone(),
             progress_forwarder.clone(),
         )
@@ -611,6 +637,7 @@ async fn handle_tool_call(
                             server,
                             &refreshed_headers,
                             request,
+                            runtime.tool_call_timeout,
                             runtime.request_context.ct.clone(),
                             progress_forwarder,
                         )
@@ -1192,12 +1219,13 @@ impl monty::PrintWriter for BoundedPrint {
 mod tests {
     use anyhow::anyhow;
     use monty::MontyObject;
+    use std::time::Duration;
 
     use super::{
         ExecutionLimits, build_monty_script, looks_like_auth_failure_error,
-        looks_like_auth_failure_message, parse_external_tool_call, parse_json_dumps_call,
-        parse_json_loads_call, parse_read_file_call, read_file_for_execution,
-        rewrite_namespaced_tool_calls,
+        looks_like_auth_failure_message, normalize_upstream_tool_timeout,
+        parse_external_tool_call, parse_json_dumps_call, parse_json_loads_call,
+        parse_read_file_call, read_file_for_execution, rewrite_namespaced_tool_calls,
     };
     use crate::config::ServerConfig;
     use crate::upstream::UpstreamRequestError;
@@ -1259,6 +1287,20 @@ mod tests {
         .expect("parse should succeed");
 
         assert!(parsed.arguments.is_empty());
+    }
+
+    #[test]
+    fn normalize_upstream_tool_timeout_clamps_to_five_minutes() {
+        let capped = normalize_upstream_tool_timeout(Some(999_999))
+            .expect("timeout should parse")
+            .expect("timeout should be present");
+        assert_eq!(capped, Duration::from_millis(300_000));
+    }
+
+    #[test]
+    fn normalize_upstream_tool_timeout_rejects_zero() {
+        let err = normalize_upstream_tool_timeout(Some(0)).expect_err("zero should fail");
+        assert!(err.contains("greater than 0"));
     }
 
     #[test]

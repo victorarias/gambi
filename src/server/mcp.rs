@@ -77,6 +77,8 @@ struct UpstreamDiscoveryOutput {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct ExecuteRequest {
     code: String,
+    #[serde(default)]
+    upstream_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -257,7 +259,7 @@ impl McpServer {
 
     #[tool(
         name = "gambi_execute",
-        description = "Safe execution path: run a Python script that can call upstream tools. Escalated tools are blocked with ESCALATION_REQUIRED.\n\nCall tools with dot syntax: server.tool(keyword=\"value\"). For non-identifier tool names (for example with dashes), use tool(\"server:tool-name\", keyword=\"value\") or call_tool(\"server:tool-name\", ...).\n\nLanguage: subset of Python. Supports variables, functions (def), if/elif/else, for/while, list/dict comprehensions, f-strings, string methods, and arithmetic. No imports, no try/except, no classes, no with statements, no set literals, no standard library.\n\nRules:\n- Keyword arguments only: server.tool(param=\"value\"), never positional args\n- Return a value: the script's return value is the tool result (dict, list, string, number, bool, or None)\n- Upstream errors abort: if any tool call returns an error, execution stops immediately\n- read_file(\"/tmp/path\") loads UTF-8 text files (only /tmp is accessible)\n- json_loads(string) parses a JSON string into a dict/list/value\n- json_dumps(value) serializes a dict/list/value to a JSON string\n- Use print() for debug output (captured in stdout field)\n\nExample:\nresources = atlassian.getAccessibleAtlassianResources()\ncloud_id = resources[0][\"id\"]\nissues = atlassian.searchJiraIssuesUsingJql(cloudId=cloud_id, jql=\"project = PDDI ORDER BY updated DESC\", limit=5)\nreturn [{\"key\": i[\"key\"], \"summary\": i[\"summary\"]} for i in issues]"
+        description = "Safe execution path: run a Python script that can call upstream tools. Escalated tools are blocked with ESCALATION_REQUIRED.\n\nCall tools with dot syntax: server.tool(keyword=\"value\"). For non-identifier tool names (for example with dashes), use tool(\"server:tool-name\", keyword=\"value\") or call_tool(\"server:tool-name\", ...).\n\nLanguage: subset of Python. Supports variables, functions (def), if/elif/else, for/while, list/dict comprehensions, f-strings, string methods, and arithmetic. No imports, no try/except, no classes, no with statements, no set literals, no standard library.\n\nRules:\n- Keyword arguments only: server.tool(param=\"value\"), never positional args\n- Return a value: the script's return value is the tool result (dict, list, string, number, bool, or None)\n- Upstream errors abort: if any tool call returns an error, execution stops immediately\n- Optional request arg `upstream_timeout_ms` sets per-execution upstream tool timeout (capped at 300000 ms)\n- read_file(\"/tmp/path\") loads UTF-8 text files (only /tmp is accessible)\n- json_loads(string) parses a JSON string into a dict/list/value\n- json_dumps(value) serializes a dict/list/value to a JSON string\n- Use print() for debug output (captured in stdout field)\n\nExample:\nresources = atlassian.getAccessibleAtlassianResources()\ncloud_id = resources[0][\"id\"]\nissues = atlassian.searchJiraIssuesUsingJql(cloudId=cloud_id, jql=\"project = PDDI ORDER BY updated DESC\", limit=5)\nreturn [{\"key\": i[\"key\"], \"summary\": i[\"summary\"]} for i in issues]"
     )]
     async fn gambi_execute(
         &self,
@@ -274,6 +276,9 @@ impl McpServer {
             &self.upstream,
             context,
             execution::ExecutionPolicy::Safe,
+            execution::ExecuteOptions {
+                upstream_timeout_ms: params.upstream_timeout_ms,
+            },
         )
         .await
         .map_err(|err| err.message)?;
@@ -288,7 +293,7 @@ impl McpServer {
 
     #[tool(
         name = "gambi_execute_escalated",
-        description = "Escalated execution path: run a Python script with full upstream tool access when safe mode returns ESCALATION_REQUIRED. Same language rules and syntax as gambi_execute."
+        description = "Escalated execution path: run a Python script with full upstream tool access when safe mode returns ESCALATION_REQUIRED. Same language rules and syntax as gambi_execute. Optional request arg `upstream_timeout_ms` sets per-execution upstream tool timeout (capped at 300000 ms)."
     )]
     async fn gambi_execute_escalated(
         &self,
@@ -305,6 +310,9 @@ impl McpServer {
             &self.upstream,
             context,
             execution::ExecutionPolicy::Escalated,
+            execution::ExecuteOptions {
+                upstream_timeout_ms: params.upstream_timeout_ms,
+            },
         )
         .await
         .map_err(|err| err.message)?;
@@ -1277,6 +1285,7 @@ Language support (subset of Python):\n\
 Behavior:\n\
 - The script's return value becomes the tool result. Always return something useful.\n\
 - If any upstream tool call returns an error, execution stops immediately.\n\
+- Optional gambi_execute request arg `upstream_timeout_ms` sets tool-call timeout for that run (max 300000 ms).\n\
 - print() output is captured in the response's stdout field (useful for debugging).\n\
 - read_file(\"/tmp/path\") loads UTF-8 text from /tmp (only /tmp is accessible).\n\
 - json_loads(string) parses a JSON string into a Python value (dict, list, etc.).\n\

@@ -34,7 +34,8 @@ use crate::config::{ServerConfig, TransportMode};
 use crate::namespacing::{namespaced, namespaced_resource_template_uri, namespaced_resource_uri};
 use crate::sse_transport::LegacySseWorker;
 
-const DEFAULT_UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_UPSTREAM_REQUEST_TIMEOUT: Duration = MAX_UPSTREAM_REQUEST_TIMEOUT;
 const DEFAULT_UPSTREAM_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const UPSTREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_PARALLEL_DISCOVERY: usize = 8;
@@ -418,7 +419,8 @@ impl Default for UpstreamManager {
             request_timeout: duration_env_ms(
                 "GAMBI_UPSTREAM_REQUEST_TIMEOUT_MS",
                 DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
-            ),
+            )
+            .min(MAX_UPSTREAM_REQUEST_TIMEOUT),
             discovery_timeout: duration_env_ms(
                 "GAMBI_UPSTREAM_DISCOVERY_TIMEOUT_MS",
                 DEFAULT_UPSTREAM_DISCOVERY_TIMEOUT,
@@ -705,6 +707,7 @@ impl UpstreamManager {
         server: &ServerConfig,
         auth_headers: &UpstreamAuthHeaders,
         mut request: CallToolRequestParams,
+        timeout_override: Option<Duration>,
         cancel: CancellationToken,
         progress_forwarder: Option<ProgressForwarder>,
     ) -> std::result::Result<CallToolResult, UpstreamRequestError> {
@@ -717,13 +720,17 @@ impl UpstreamManager {
             .register_progress_forwarder(&client, progress_forwarder)
             .await;
 
+        let request_timeout = timeout_override
+            .unwrap_or(self.request_timeout)
+            .min(MAX_UPSTREAM_REQUEST_TIMEOUT);
+
         let meta = request.meta.take();
         let handle = client
             .peer
             .send_cancellable_request(
                 ClientRequest::CallToolRequest(Request::new(request)),
                 PeerRequestOptions {
-                    timeout: Some(self.request_timeout),
+                    timeout: Some(request_timeout),
                     meta,
                 },
             )
@@ -1716,9 +1723,10 @@ mod tests {
 
     use super::{
         BoundedExponentialBackoff, DISCOVERY_CACHE_TTL, DiscoveryCacheEntry, DiscoveryFailure,
-        DiscoveryResult, UpstreamAuthFailure, UpstreamManager, UpstreamTransportTarget,
-        auth_headers_from_token_state, message_has_auth_required_marker, parse_stdio_target,
-        parse_upstream_target, transport_error_is_auth_failure,
+        DiscoveryResult, MAX_UPSTREAM_REQUEST_TIMEOUT, UpstreamAuthFailure, UpstreamManager,
+        UpstreamTransportTarget, auth_headers_from_token_state, duration_env_ms,
+        message_has_auth_required_marker, parse_stdio_target, parse_upstream_target,
+        transport_error_is_auth_failure,
     };
 
     #[test]
@@ -1861,6 +1869,18 @@ mod tests {
         ));
         assert!(transport_error_is_auth_failure(&err));
         assert!(message_has_auth_required_marker(&err.to_string()));
+    }
+
+    #[test]
+    fn request_timeout_is_capped_to_maximum() {
+        assert_eq!(
+            duration_env_ms(
+                "GAMBI_UPSTREAM_REQUEST_TIMEOUT_MS",
+                Duration::from_secs(1_000)
+            )
+            .min(MAX_UPSTREAM_REQUEST_TIMEOUT),
+            MAX_UPSTREAM_REQUEST_TIMEOUT
+        );
     }
 
     #[tokio::test]
