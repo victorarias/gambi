@@ -785,6 +785,10 @@ fn build_monty_limits(limits: &ExecutionLimits) -> ResourceLimits {
 fn build_monty_script(code: &str, servers: &[ServerConfig]) -> Result<String> {
     let rewritten = rewrite_namespaced_tool_calls(code, servers)?;
     let mut script = String::new();
+    script.push_str("def tool(name, **kwargs):\n");
+    script.push_str("    return __gambi_call__(name, **kwargs)\n\n");
+    script.push_str("def call_tool(name, **kwargs):\n");
+    script.push_str("    return __gambi_call__(name, **kwargs)\n\n");
     script.push_str("def read_file(path):\n");
     script.push_str("    return __gambi_read_file__(path)\n\n");
     script.push_str("def json_loads(s):\n");
@@ -1231,6 +1235,10 @@ mod tests {
         )
         .expect("script build should succeed");
 
+        assert!(script.contains("def tool(name, **kwargs):"));
+        assert!(script.contains("return __gambi_call__(name, **kwargs)"));
+        assert!(script.contains("def call_tool(name, **kwargs):"));
+        assert!(script.contains("return __gambi_call__(name, **kwargs)"));
         assert!(script.contains("def read_file(path):"));
         assert!(script.contains("return __gambi_read_file__(path)"));
         assert!(script.contains("def json_loads(s):"));

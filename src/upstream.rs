@@ -1465,16 +1465,32 @@ async fn spawn_managed_sse_client(
         .context("failed to construct reqwest client for legacy-sse transport")?;
 
     let worker = LegacySseWorker::new(
-        http_client,
+        http_client.clone(),
         target.uri.clone(),
         auth_header.map(std::string::ToString::to_string),
     );
 
     let handler = UpstreamClient::default();
-    let service =
-        handler.clone().serve(worker).await.with_context(|| {
-            format!("failed to initialize MCP SSE client for '{}'", server.name)
-        })?;
+    let service = match handler.clone().serve(worker).await {
+        Ok(service) => service,
+        Err(err) => {
+            let probe_target = HttpServerTarget {
+                uri: target.uri.clone(),
+            };
+            // Legacy SSE often surfaces auth failures as opaque channel-close errors.
+            // Probe the endpoint directly to classify 401/403 + WWW-Authenticate reliably.
+            if let Some(auth_failure) =
+                probe_http_auth_failure(server, &probe_target, &http_client, auth_header).await
+            {
+                return Err(anyhow!(auth_failure)).with_context(|| {
+                    format!("failed to initialize MCP SSE client for '{}'", server.name)
+                });
+            }
+            return Err(err).with_context(|| {
+                format!("failed to initialize MCP SSE client for '{}'", server.name)
+            });
+        }
+    };
 
     let peer = service.peer().clone();
     let instructions = peer

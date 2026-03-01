@@ -57,7 +57,7 @@ Optional flags:
 
 ```bash
 # install a specific tag
-curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --version v0.1.1
+curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --version v0.1.2
 
 # install into a custom directory
 curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --bin-dir "$HOME/.local/bin"
@@ -132,6 +132,7 @@ gambi remove github
 ```
 
 Or through the admin UI at `http://127.0.0.1:3333`.
+The server target field accepts either URL form (`https://...`, `stdio://...`) or command form (`npx -y @railway/mcp-server`).
 
 ### 3. Use it
 
@@ -183,7 +184,16 @@ result = github.get_issue(issue_id="123")
 slack.post_message(channel="eng", text=f"Issue loaded: {result['id']}")
 ```
 
+For non-identifier tool names (for example names containing `-`), use string-based calls:
+
+```python
+result = tool("railway_mcp:list-projects")
+# or
+result = call_tool("railway_mcp:list-projects")
+```
+
 - Calls are namespaced: `server.tool(**kwargs)`
+- For non-identifier names, use `tool("server:tool-name", **kwargs)` or `call_tool("server:tool-name", **kwargs)`
 - Keyword arguments only (positional args are rejected)
 - `read_file(path)` is built in for UTF-8 text file input from `/tmp` only (no imports required)
 - Upstream errors (`is_error=true`) fail the execution

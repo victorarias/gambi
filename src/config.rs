@@ -1249,6 +1249,10 @@ fn validate_server_name(raw_name: &str) -> Result<String> {
         bail!("server name cannot contain whitespace or control characters");
     }
 
+    if name.contains('-') {
+        bail!("server name cannot contain '-'");
+    }
+
     Ok(name.to_string())
 }
 
@@ -1622,6 +1626,18 @@ mod tests {
             })
             .expect_err("name with whitespace should fail");
         assert!(with_space.to_string().contains("whitespace"));
+
+        let with_dash = cfg
+            .add_server(ServerConfig {
+                name: "bad-name".to_string(),
+                url: "https://example.com".to_string(),
+                oauth: None,
+                transport: Default::default(),
+                exposure_mode: Default::default(),
+                enabled: true,
+            })
+            .expect_err("name with dash should fail");
+        assert!(with_dash.to_string().contains("cannot contain '-'"));
     }
 
     #[test]
@@ -1646,7 +1662,7 @@ mod tests {
 
         let bad_stdio = cfg
             .add_server(ServerConfig {
-                name: "stdio-bad".to_string(),
+                name: "stdio_bad".to_string(),
                 url: "stdio:///".to_string(),
                 oauth: None,
                 transport: Default::default(),
@@ -1933,7 +1949,7 @@ mod tests {
 
         let bad_discovery = cfg
             .add_server(ServerConfig {
-                name: "oauth-discovery-bad".to_string(),
+                name: "oauth_discovery_bad".to_string(),
                 url: "https://example.com/mcp".to_string(),
                 oauth: Some(OAuthConfig {
                     discovery_url: Some("ftp://example.com/discovery".to_string()),
@@ -1951,7 +1967,7 @@ mod tests {
 
         let bad = cfg
             .add_server(ServerConfig {
-                name: "oauth-bad".to_string(),
+                name: "oauth_bad".to_string(),
                 url: "https://example.com/mcp".to_string(),
                 oauth: Some(OAuthConfig {
                     discovery_url: None,
@@ -1968,7 +1984,7 @@ mod tests {
         assert!(bad.to_string().contains("invalid oauth authorize_url"));
 
         cfg.add_server(ServerConfig {
-            name: "oauth-good".to_string(),
+            name: "oauth_good".to_string(),
             url: "https://example.com/mcp".to_string(),
             oauth: Some(OAuthConfig {
                 discovery_url: Some(
@@ -2059,7 +2075,7 @@ mod tests {
             workers.push(thread::spawn(move || {
                 store.update(|cfg| {
                     cfg.add_server(ServerConfig {
-                        name: format!("server-{idx}"),
+                        name: format!("server_{idx}"),
                         url: format!("https://example.com/{idx}"),
                         oauth: None,
                         transport: Default::default(),
@@ -2079,8 +2095,8 @@ mod tests {
 
         let cfg = store.load().expect("final config must load");
         assert_eq!(cfg.servers.len(), 8);
-        assert_eq!(cfg.servers[0].name, "server-0");
-        assert_eq!(cfg.servers[7].name, "server-7");
+        assert_eq!(cfg.servers[0].name, "server_0");
+        assert_eq!(cfg.servers[7].name, "server_7");
     }
 
     #[test]

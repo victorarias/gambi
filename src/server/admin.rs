@@ -649,7 +649,7 @@ async fn root() -> Html<&'static str> {
       <div class="pb">
         <form id="server-add-form" class="server-add">
           <input id="server-name" placeholder="server name (e.g. github)" required>
-          <input id="server-url" placeholder="url (e.g. stdio://... or https://...)" required>
+          <input id="server-url" placeholder="url or command (e.g. https://... or npx -y @railway/mcp-server)" required>
           <select id="server-exposure-add">
             <option value="passthrough">passthrough</option>
             <option value="compact">compact</option>
@@ -776,6 +776,100 @@ async fn root() -> Html<&'static str> {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+    }
+
+    function looksLikeServerUrl(value) {
+      return value.startsWith('stdio://') || value.startsWith('http://') || value.startsWith('https://');
+    }
+
+    function splitShellWords(input) {
+      const parts = [];
+      let current = '';
+      let quote = '';
+      let escaping = false;
+
+      for (const ch of input) {
+        if (escaping) {
+          current += ch;
+          escaping = false;
+          continue;
+        }
+
+        if (quote === '\'') {
+          if (ch === '\'') {
+            quote = '';
+          } else {
+            current += ch;
+          }
+          continue;
+        }
+
+        if (ch === '\\') {
+          escaping = true;
+          continue;
+        }
+
+        if (quote === '"') {
+          if (ch === '"') {
+            quote = '';
+          } else {
+            current += ch;
+          }
+          continue;
+        }
+
+        if (ch === '\'' || ch === '"') {
+          quote = ch;
+          continue;
+        }
+
+        if (/\s/.test(ch)) {
+          if (current) {
+            parts.push(current);
+            current = '';
+          }
+          continue;
+        }
+
+        current += ch;
+      }
+
+      if (escaping) {
+        throw new Error('unterminated escape sequence in command');
+      }
+      if (quote) {
+        throw new Error('unterminated quoted string in command');
+      }
+      if (current) {
+        parts.push(current);
+      }
+      return parts;
+    }
+
+    function normalizeServerTarget(rawInput) {
+      const trimmed = (rawInput || '').trim();
+      if (!trimmed) {
+        throw new Error('server target is required');
+      }
+      if (looksLikeServerUrl(trimmed)) {
+        return trimmed;
+      }
+
+      const argv = splitShellWords(trimmed);
+      if (!argv.length) {
+        throw new Error('server target is required');
+      }
+      const command = argv[0];
+      if (command.includes('?') || command.includes('#')) {
+        throw new Error('command target cannot include ? or #');
+      }
+
+      const params = new URLSearchParams();
+      for (let i = 1; i < argv.length; i++) {
+        params.append('arg', argv[i]);
+      }
+      const query = params.toString();
+      return query ? ('stdio://' + command + '?' + query) : ('stdio://' + command);
     }
 
     function readHashTab() {
@@ -969,21 +1063,21 @@ async fn root() -> Html<&'static str> {
 
     function statusChipForAuth(auth, serverEnabled) {
       if (!serverEnabled) {
-        return { dot: 'dot-off', text: 'disabled', action: '' };
+        return { dot: 'dot-off', text: 'disabled', action: '', canLogin: false, loginLabel: 'login' };
       }
       if (!auth || !auth.oauth_configured) {
-        return { dot: 'dot-off', text: 'not configured', action: '' };
+        return { dot: 'dot-off', text: 'not configured', action: '', canLogin: false, loginLabel: 'login' };
       }
       if (!auth.has_token) {
-        return { dot: 'dot-off', text: 'no token', action: 'login' };
+        return { dot: 'dot-off', text: 'no token', action: 'login', canLogin: true, loginLabel: 'login' };
       }
       if (auth.last_error) {
-        return { dot: 'dot-err', text: auth.last_error, action: 'refresh' };
+        return { dot: 'dot-err', text: auth.last_error, action: 'refresh', canLogin: true, loginLabel: 'relogin' };
       }
       if (auth.degraded) {
-        return { dot: 'dot-warn', text: 'degraded', action: 'refresh' };
+        return { dot: 'dot-warn', text: 'degraded', action: 'refresh', canLogin: true, loginLabel: 'relogin' };
       }
-      return { dot: 'dot-ok', text: 'authenticated', action: '' };
+      return { dot: 'dot-ok', text: 'authenticated', action: '', canLogin: true, loginLabel: 'relogin' };
     }
 
     function renderStatusStrip() {
@@ -998,8 +1092,8 @@ async fn root() -> Html<&'static str> {
         const auth = authViewModelByServer(server.name);
         const status = statusChipForAuth(auth, server.enabled !== false);
         h += '<span class="status-chip"><span class="dot ' + status.dot + '"></span>' + esc(server.name) + ': ' + esc(status.text) + '</span>';
-        if (status.action === 'login') {
-          h += '<button class="btn-quiet" type="button" data-action="status-login" data-server="' + escAttrHtml(server.name) + '">login</button>';
+        if (status.canLogin) {
+          h += '<button class="btn-quiet" type="button" data-action="status-login" data-server="' + escAttrHtml(server.name) + '">' + esc(status.loginLabel) + '</button>';
         }
         if (status.action === 'refresh') {
           h += '<button class="btn-quiet" type="button" data-action="status-refresh" data-server="' + escAttrHtml(server.name) + '">refresh</button>';
@@ -1039,11 +1133,13 @@ async fn root() -> Html<&'static str> {
         h += '<select class="server-exposure-select" data-server="' + escAttrHtml(s.name) + '">' + exposureOptions(exposure) + '</select>';
         h += '<select class="server-policy-select" data-server="' + escAttrHtml(s.name) + '">' + policyOptions(policy) + '</select>';
         h += '<select class="server-tool-default-select" data-server="' + escAttrHtml(s.name) + '">' + toolDefaultOptions(toolDefault) + '</select>';
-        if (authStatus.action === 'login') {
-          h += '<button type="button" class="btn-quiet" data-action="server-login" data-server="' + escAttrHtml(s.name) + '">Login</button>';
-        } else if (authStatus.action === 'refresh') {
+        if (authStatus.action === 'refresh') {
           h += '<button type="button" class="btn-quiet" data-action="server-refresh" data-server="' + escAttrHtml(s.name) + '">Refresh</button>';
-        } else {
+        }
+        if (authStatus.canLogin) {
+          h += '<button type="button" class="btn-quiet" data-action="server-login" data-server="' + escAttrHtml(s.name) + '">' + esc(authStatus.loginLabel) + '</button>';
+        }
+        if (!authStatus.canLogin && authStatus.action !== 'refresh') {
           h += '<span class="pill pill-src">' + (enabled ? 'auth ok' : 'disabled') + '</span>';
         }
         h += '<button type="button" class="btn-quiet" data-action="toggle-server" data-server="' + escAttrHtml(s.name) + '" data-enabled="' + escAttrHtml(String(enabled)) + '">' + toggleLabel + '</button>';
@@ -1741,9 +1837,11 @@ async fn root() -> Html<&'static str> {
     document.getElementById('server-add-form').addEventListener('submit', async function(event) {
       event.preventDefault();
       await runAction('add server', async function() {
+        const rawTarget = document.getElementById('server-url').value;
+        const normalizedTarget = normalizeServerTarget(rawTarget);
         await postJson('/servers', {
           name: document.getElementById('server-name').value,
-          url: document.getElementById('server-url').value,
+          url: normalizedTarget,
           exposure_mode: document.getElementById('server-exposure-add').value,
           policy_mode: document.getElementById('server-policy-add').value,
           tool_activation_mode: document.getElementById('server-tool-default-add').value
@@ -2308,8 +2406,6 @@ async fn build_tools_snapshot(
         if !looks_like_auth_failure(&failure.message) {
             continue;
         }
-        let should_try_refresh = looks_like_invalid_token(&failure.message)
-            || looks_like_initialize_decode_auth_failure(&failure.message);
         let is_http = enabled_servers
             .iter()
             .find(|server| server.name == failure.server_name)
@@ -2322,6 +2418,7 @@ async fn build_tools_snapshot(
 
         let auth = state.auth.clone();
         let upstream = state.upstream.clone();
+        let store = state.store.clone();
         let server_name = failure.server_name.clone();
         let admin_base_url = state.admin_base_url.clone();
         tokio::spawn(async move {
@@ -2335,24 +2432,21 @@ async fn build_tools_snapshot(
                     "oauth bootstrap after auth-required upstream failure did not succeed"
                 );
             }
-            if should_try_refresh {
-                match auth.refresh(&server_name).await {
-                    Ok(response) => {
-                        info!(
-                            server = %server_name,
-                            refreshed = response.refreshed,
-                            expires_at_epoch_seconds = ?response.expires_at_epoch_seconds,
-                            "upstream reported invalid_token; oauth refresh succeeded"
-                        );
-                        upstream.invalidate_discovery_cache().await;
-                    }
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            server = %server_name,
-                            "upstream reported invalid_token and oauth refresh failed"
-                        );
-                    }
+            match refresh_auth_for_server_if_possible(&store, &auth, &server_name).await {
+                Ok(true) => {
+                    info!(
+                        server = %server_name,
+                        "upstream reported auth failure; oauth refresh succeeded"
+                    );
+                    upstream.invalidate_discovery_cache().await;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        server = %server_name,
+                        "upstream reported auth failure and oauth refresh failed"
+                    );
                 }
             }
         });
@@ -2578,6 +2672,29 @@ fn looks_like_auth_failure(message: &str) -> bool {
         || looks_like_auth_required(message)
         || looks_like_invalid_token(message)
         || looks_like_initialize_decode_auth_failure(message)
+}
+
+async fn refresh_auth_for_server_if_possible(
+    store: &ConfigStore,
+    auth: &AuthManager,
+    server_name: &str,
+) -> Result<bool> {
+    let tokens: TokenState = store.load_tokens_async().await?;
+    let Some(token) = tokens.oauth_tokens.get(server_name) else {
+        return Ok(false);
+    };
+    if token.refresh_token.is_none() {
+        return Ok(false);
+    }
+
+    let response = auth.refresh(server_name).await?;
+    info!(
+        server = %server_name,
+        refreshed = response.refreshed,
+        expires_at_epoch_seconds = ?response.expires_at_epoch_seconds,
+        "oauth refresh succeeded after upstream auth failure"
+    );
+    Ok(true)
 }
 
 async fn logs(Query(query): Query<LogsQuery>) -> Result<Json<LogsResponse>, ApiError> {

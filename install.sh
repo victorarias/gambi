@@ -14,7 +14,7 @@ Usage:
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh
-  curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --version v0.1.1
+  curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --version v0.1.2
   curl -fsSL https://raw.githubusercontent.com/victorarias/gambi/main/install.sh | sh -s -- --bin-dir "$HOME/.local/bin"
 EOF
 }
