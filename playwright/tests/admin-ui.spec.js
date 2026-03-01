@@ -360,12 +360,12 @@ test.describe("admin UI", () => {
         .toEqual([]);
 
       await page.fill("#server-name", "invalid-server");
-      await page.fill("#server-url", "ftp://example.com/not-supported");
+      await page.fill("#server-url", "https://example.com/mcp");
       await page.locator("#server-add-form button[type=submit]").click();
 
       await expect.poll(async () => readErrorPane(page)).toContain("add server failed");
       await expect.poll(async () => readErrorPane(page)).toContain(
-        "unsupported server url scheme",
+        "server name cannot contain '-'",
       );
       await expect
         .poll(async () => {
